@@ -1,6 +1,9 @@
 from fastapi import FastAPI, UploadFile, File
+from utils.embeddings import embed_texts
 from utils.chunking import chunk_text
+from datetime import datetime
 from pypdf import PdfReader
+import numpy as np
 import json
 import os
 
@@ -33,11 +36,17 @@ async def upload_file(file: UploadFile = File(...)):
         f.write(extracted_text)
 
     chunks = chunk_text(extracted_text)
+    created_at = datetime.utcnow().isoformat()
 
     chunk_data = []
-    for index, chunk in enumerate(chunks):
+    for index, (char_start, char_end, chunk) in enumerate(chunks):
         chunk_data.append({
         "chunk_id": index,
+        "filename": file.filename,
+        "source_path": temp_path,
+        "created_at": created_at,
+        "char_start": char_start,
+        "char_end": char_end,
         "content": chunk
         })
 
@@ -46,9 +55,17 @@ async def upload_file(file: UploadFile = File(...)):
     with open(chunk_path, "w", encoding="utf-8") as f:
         json.dump(chunk_data, f, indent=2)
 
+    texts = [c["content"] for c in chunk_data]
+    vectors = embed_texts(texts)
+
+    emb_filename = file.filename.replace(".pdf", "_embeddings.npy")
+    emb_path = os.path.join(DATA_DIR, emb_filename)
+    np.save(emb_path, vectors)
+
     return {
         "filename": file.filename,
         "total_characters": len(extracted_text),
         "total_chunks": len(chunk_data),
+        "embedding_dim": int(vectors.shape[1]),
         "first_chunk_preview": chunk_data[0]["content"][:200] if chunk_data else ""
     }

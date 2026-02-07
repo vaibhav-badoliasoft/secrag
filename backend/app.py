@@ -1,71 +1,81 @@
-from fastapi import FastAPI, UploadFile, File
-from utils.embeddings import embed_texts
-from utils.chunking import chunk_text
-from datetime import datetime
-from pypdf import PdfReader
-import numpy as np
-import json
-import os
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from pathlib import Path
+from utils.uploader import process_pdf_upload
+from utils.retriever import retrieve_top_k
 
 app = FastAPI()
 
-DATA_DIR = "../data"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = (BASE_DIR / ".." / "data").resolve()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-os.makedirs(DATA_DIR, exist_ok=True)
 
 @app.get("/health")
 def health_check():
     return {"status": "SecRAG backend is running"}
 
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+
     contents = await file.read()
+    pdf_path = DATA_DIR / file.filename
 
-    temp_path = os.path.join(DATA_DIR, file.filename)
-    with open(temp_path, "wb") as f:
-        f.write(contents)
+    try:
+        pdf_path.write_bytes(contents)
+        result = process_pdf_upload(str(pdf_path), str(DATA_DIR))
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    reader = PdfReader(temp_path)
-    extracted_text = ""
-    for page in reader.pages:
-        extracted_text += page.extract_text() or ""
-    
-    text_filename = file.filename.replace(".pdf", ".txt")
-    text_path = os.path.join(DATA_DIR, text_filename)
-    with open(text_path, "w", encoding="utf-8") as f:
-        f.write(extracted_text)
 
-    chunks = chunk_text(extracted_text)
-    created_at = datetime.utcnow().isoformat()
+class RetrieveRequest(BaseModel):
+    filename: str
+    query: str
+    top_k: int = 5
+    min_score: float | None = None
 
-    chunk_data = []
-    for index, (char_start, char_end, chunk) in enumerate(chunks):
-        chunk_data.append({
-        "chunk_id": index,
-        "filename": file.filename,
-        "source_path": temp_path,
-        "created_at": created_at,
-        "char_start": char_start,
-        "char_end": char_end,
-        "content": chunk
-        })
 
-    chunk_filename = file.filename.replace(".pdf", "_chunks.json")
-    chunk_path = os.path.join(DATA_DIR, chunk_filename)
-    with open(chunk_path, "w", encoding="utf-8") as f:
-        json.dump(chunk_data, f, indent=2)
+@app.post("/retrieve")
+def retrieve(req: RetrieveRequest):
+    filename = req.filename.strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename cannot be empty")
 
-    texts = [c["content"] for c in chunk_data]
-    vectors = embed_texts(texts)
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
 
-    emb_filename = file.filename.replace(".pdf", "_embeddings.npy")
-    emb_path = os.path.join(DATA_DIR, emb_filename)
-    np.save(emb_path, vectors)
+    chunk_filename = filename.replace(".pdf", "_chunks.json")
+    emb_filename = filename.replace(".pdf", "_embeddings.npy")
+
+    chunk_path = DATA_DIR / chunk_filename
+    emb_path = DATA_DIR / emb_filename
+
+    if not chunk_path.exists():
+        raise HTTPException(status_code=404, detail="Chunks file not found. Upload PDF first.")
+    if not emb_path.exists():
+        raise HTTPException(status_code=404, detail="Embeddings file not found. Upload PDF first.")
+
+    try:
+        results = retrieve_top_k(
+            chunks_path=chunk_path,
+            embeddings_path=emb_path,
+            query=req.query,
+            top_k=req.top_k,
+            min_score=req.min_score
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Retrieval failed: {e}")
 
     return {
-        "filename": file.filename,
-        "total_characters": len(extracted_text),
-        "total_chunks": len(chunk_data),
-        "embedding_dim": int(vectors.shape[1]),
-        "first_chunk_preview": chunk_data[0]["content"][:200] if chunk_data else ""
+        "filename": filename,
+        "query": req.query,
+        "top_k": req.top_k,
+        "results": results
     }

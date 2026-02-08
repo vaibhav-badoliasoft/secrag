@@ -3,6 +3,7 @@ import json
 import numpy as np
 from datetime import datetime
 from pypdf import PdfReader
+from pathlib import Path
 
 from utils.chunking import chunk_text
 from utils.embeddings import embed_texts
@@ -37,17 +38,16 @@ def process_pdf_upload(file_path: str, data_dir: str):
             "content": chunk
         })
 
-    # Save chunks JSON
     chunk_filename = os.path.basename(file_path).replace(".pdf", "_chunks.json")
     chunk_path = os.path.join(data_dir, chunk_filename)
     with open(chunk_path, "w", encoding="utf-8") as f:
         json.dump(chunk_data, f, indent=2)
 
-    # Embed + save embeddings
     texts = [c["content"] for c in chunk_data]
     vectors = embed_texts(texts)
 
-    emb_filename = os.path.basename(file_path).replace(".pdf", "_embeddings.npy")
+    stem = Path(file_path).stem
+    emb_filename = f"{stem}_embedding.npy"
     emb_path = os.path.join(data_dir, emb_filename)
     np.save(emb_path, vectors)
 

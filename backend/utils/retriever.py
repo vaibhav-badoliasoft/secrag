@@ -38,8 +38,8 @@ def retrieve_top_k(
     if len(chunks) != embeddings.shape[0]:
         raise ValueError("Mismatch: chunks count != embeddings rows")
 
-    q = embed_query(query)      # (384,)
-    scores = embeddings @ q     # cosine similarity (because normalized)
+    q = embed_query(query)
+    scores = embeddings @ q
 
     k = min(top_k, scores.shape[0])
     top_idx = np.argpartition(-scores, k - 1)[:k]

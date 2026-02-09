@@ -1,32 +1,51 @@
 import json
 import numpy as np
 from pathlib import Path
-
 from utils.embeddings import embed_query
+
+_CACHE = {
+    "chunks": {},
+    "embeddings": {},
+}
+
+def _mtime(p: Path) -> float:
+    return p.stat().st_mtime
 
 
 def load_chunks(chunks_path: Path):
-    with open(chunks_path, "r", encoding="utf-8") as f:
+    p = Path(chunks_path)
+    m = _mtime(p)
+
+    cached = _CACHE["chunks"].get(str(p))
+    if cached and cached["mtime"] == m:
+        return cached["data"]
+
+    with open(p, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
         raise ValueError("Chunks JSON must be a list")
+
+    _CACHE["chunks"][str(p)] = {"mtime": m, "data": data}
     return data
 
 
 def load_embeddings(embeddings_path: Path):
-    emb = np.load(embeddings_path).astype(np.float32)
+    p = Path(embeddings_path)
+    m = _mtime(p)
+
+    cached = _CACHE["embeddings"].get(str(p))
+    if cached and cached["mtime"] == m:
+        return cached["data"]
+
+    emb = np.load(p).astype(np.float32)
     if emb.ndim != 2:
         raise ValueError("Embeddings must be 2D (num_chunks, dim)")
+
+    _CACHE["embeddings"][str(p)] = {"mtime": m, "data": emb}
     return emb
 
 
-def retrieve_top_k(
-    chunks_path: Path,
-    embeddings_path: Path,
-    query: str,
-    top_k: int = 5,
-    min_score=None
-):
+def retrieve_top_k(chunks_path: Path, embeddings_path: Path, query: str, top_k: int = 5, min_score=None):
     if not query or not query.strip():
         raise ValueError("Query cannot be empty")
     if top_k <= 0:
@@ -66,3 +85,18 @@ def retrieve_top_k(
         })
 
     return results
+
+
+def cache_status():
+    return {
+        "chunks_cached": len(_CACHE["chunks"]),
+        "embeddings_cached": len(_CACHE["embeddings"]),
+    }
+
+
+def load_meta(meta_path: Path):
+    p = Path(meta_path)
+    if not p.exists():
+        return None
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)

@@ -1,54 +1,49 @@
-# SecRAG
+## Current Capabilities
 
-SecRAG is a modular Retrieval-Augmented Generation (RAG) system for asking questions over PDF documents.
+### Backend
+- PDF upload and storage
+- Text extraction using `pypdf`
+- Character-based chunking (size = 500, overlap = 100)
+- 384-dimensional normalized embeddings using MiniLM
+- Cosine similarity search via NumPy dot product
+- `/retrieve` endpoint (top-k similarity results)
+- `/answer` endpoint (grounded responses + citations)
+- `/summarize` endpoint (Hybrid strategy: intro + retrieved chunks)
+- Citation metadata:
+  - chunk_id
+  - similarity score
+  - character range
+  - source type (intro / retrieved / hybrid)
 
-It uploads PDFs, extracts text, chunks it, generates embeddings, performs similarity search, and produces grounded answers with citations using OpenAI.
-
----
-
-## Current Capabilities (Day 7)
-
-- Upload PDF documents  
-- Extract text using `pypdf`  
-- Split text into overlapping character-based chunks  
-  - chunk size = 500  
-  - overlap = 100  
-- Store chunk metadata (char offsets, timestamps, source path)  
-- Generate 384-dimensional normalized embeddings using MiniLM  
-- Save embeddings as `_embedding.npy`  
-- Perform cosine similarity search using dot product  
-- Retrieve top-k chunks via `/retrieve`  
-- Generate grounded answers via `/answer`  
-- Return citation metadata:
-  - chunk_id  
-  - similarity score  
-  - character range  
-
-### Frontend (React UI)
-
-- Upload documents from sidebar  
-- Select document dynamically  
-- Chat interface  
-- Confidence scoring (based on top similarity score)  
-- Expandable citation viewer  
-- Copy answer button  
-- Clear chat option  
-- Sample question buttons  
-- Auto-scroll behavior  
+### Frontend (React)
+- Document upload and dynamic selection
+- Chat-style interface
+- Confidence indicator (based on similarity score)
+- Expandable citation viewer
+- Copy answer button
+- Hybrid document summarization
+- Clear chat option
+- Sample prompt buttons
 
 ---
 
 ## Architecture
 
-Client (React)  
-→ FastAPI  
-→ PDF Upload  
-→ Text Extraction  
+React Client  
+→ FastAPI Backend  
+→ PDF Extraction  
 → Chunking  
-→ Embedding Generation  
-→ Vector Storage  
-→ Query Embedding  
-→ Similarity Search  
-→ Top-K Retrieval  
+→ Embedding Generation (MiniLM)  
+→ Vector Similarity Search (NumPy)  
+→ Retrieval  
 → OpenAI  
-→ Answer + Citations
+→ Answer / Summary + Citations  
+
+---
+
+## Design Philosophy
+
+- Transparent (citation-backed responses)
+- Modular (clear separation of API, retrieval, generation)
+- Cost-efficient (local embeddings)
+- Interview-ready (manual RAG implementation without heavy abstraction frameworks)

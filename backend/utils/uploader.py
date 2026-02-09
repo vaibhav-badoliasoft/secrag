@@ -16,13 +16,11 @@ def process_pdf_upload(file_path: str, data_dir: str):
     for page in reader.pages:
         extracted_text += page.extract_text() or ""
 
-    # Save extracted text
     text_filename = os.path.basename(file_path).replace(".pdf", ".txt")
     text_path = os.path.join(data_dir, text_filename)
     with open(text_path, "w", encoding="utf-8") as f:
         f.write(extracted_text)
 
-    # Chunk
     chunks = chunk_text(extracted_text)
     created_at = datetime.utcnow().isoformat()
 

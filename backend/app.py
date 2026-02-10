@@ -2,9 +2,12 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
+import time
+import uuid
+from fastapi import Request
 
 from utils.uploader import process_pdf_upload
-from utils.retriever import retrieve_top_k, load_chunks, load_meta, cache_status
+from utils.retriever import retrieve_top_k, load_chunks
 from utils.naming import get_artifact_paths
 from utils.llm import generate_answer, generate_sample_questions
 from utils.summarizer import summarize_from_chunks
@@ -23,11 +26,23 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = (BASE_DIR / ".." / "data").resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+    start = time.time()
+
+    response = await call_next(request)
+
+    elapsed = time.time() - start
+    print(f"[{request_id}] {request.method} {request.url.path} -> {response.status_code} in {elapsed:.4f}s")
+
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Process-Time"] = f"{elapsed:.4f}"
+    return response
 
 @app.get("/health")
 def health_check():
     return {"status": "SecRAG backend is running"}
-
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -49,7 +64,8 @@ class RetrieveRequest(BaseModel):
     query: str
     top_k: int = 5
     min_score: float | None = None
-
+    mode: str = "hybrid"
+    alpha: float = 0.7
 
 @app.post("/retrieve")
 def retrieve(req: RetrieveRequest):
@@ -73,8 +89,11 @@ def retrieve(req: RetrieveRequest):
             embeddings_path=emb_path,
             query=req.query,
             top_k=req.top_k,
-            min_score=req.min_score
+            min_score=req.min_score,
+            mode=req.mode,
+            alpha=req.alpha
         )
+
         return {"filename": filename, "query": req.query, "top_k": req.top_k, "results": results}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -87,7 +106,8 @@ class AnswerRequest(BaseModel):
     query: str
     top_k: int = 5
     min_score: float | None = None
-
+    mode: str = "hybrid"
+    alpha: float = 0.7
 
 @app.post("/answer")
 def answer(req: AnswerRequest):
@@ -109,7 +129,9 @@ def answer(req: AnswerRequest):
             embeddings_path=emb_path,
             query=req.query,
             top_k=req.top_k,
-            min_score=req.min_score
+            min_score=req.min_score,
+            mode=req.mode,
+            alpha=req.alpha
         )
 
         if not retrieved:

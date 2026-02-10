@@ -5,7 +5,7 @@ from datetime import datetime
 from pypdf import PdfReader
 from pathlib import Path
 
-from utils.chunking import chunk_text
+from utils.chunking_v2 import chunk_text_sentence_based
 from utils.embeddings import embed_texts
 
 
@@ -14,14 +14,14 @@ def process_pdf_upload(file_path: str, data_dir: str):
 
     extracted_text = ""
     for page in reader.pages:
-        extracted_text += (page.extract_text() or "") + "\n"
+        extracted_text += page.extract_text() or ""
 
     text_filename = os.path.basename(file_path).replace(".pdf", ".txt")
     text_path = os.path.join(data_dir, text_filename)
     with open(text_path, "w", encoding="utf-8") as f:
         f.write(extracted_text)
 
-    chunks = chunk_text(extracted_text)
+    chunks = chunk_text_sentence_based(extracted_text, chunk_size=500, overlap_sentences=1)
     created_at = datetime.utcnow().isoformat()
 
     chunk_data = []
@@ -49,25 +49,10 @@ def process_pdf_upload(file_path: str, data_dir: str):
     emb_path = os.path.join(data_dir, emb_filename)
     np.save(emb_path, vectors)
 
-    meta = {
-        "filename": os.path.basename(file_path),
-        "stem": stem,
-        "created_at": created_at,
-        "total_characters": len(extracted_text),
-        "total_chunks": len(chunk_data),
-        "embedding_dim": int(vectors.shape[1]) if vectors.ndim == 2 else 0,
-        "chunk_file": os.path.basename(chunk_path),
-        "embedding_file": os.path.basename(emb_path),
-    }
-    meta_path = os.path.join(data_dir, f"{stem}_meta.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
     return {
         "filename": os.path.basename(file_path),
         "total_characters": len(extracted_text),
         "total_chunks": len(chunk_data),
         "embedding_dim": int(vectors.shape[1]) if vectors.ndim == 2 else 0,
-        "created_at": created_at,
         "first_chunk_preview": chunk_data[0]["content"][:200] if chunk_data else ""
     }

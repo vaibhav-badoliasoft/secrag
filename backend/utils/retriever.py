@@ -1,78 +1,43 @@
 import json
 import numpy as np
 from pathlib import Path
+
 from utils.embeddings import embed_query
-
-_CACHE = {
-    "chunks": {},
-    "embeddings": {},
-}
-
-def _mtime(p: Path) -> float:
-    return p.stat().st_mtime
+from utils.bm25 import build_bm25, bm25_scores
 
 
 def load_chunks(chunks_path: Path):
-    p = Path(chunks_path)
-    m = _mtime(p)
-
-    cached = _CACHE["chunks"].get(str(p))
-    if cached and cached["mtime"] == m:
-        return cached["data"]
-
-    with open(p, "r", encoding="utf-8") as f:
+    with open(chunks_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
         raise ValueError("Chunks JSON must be a list")
-
-    _CACHE["chunks"][str(p)] = {"mtime": m, "data": data}
     return data
 
 
 def load_embeddings(embeddings_path: Path):
-    p = Path(embeddings_path)
-    m = _mtime(p)
-
-    cached = _CACHE["embeddings"].get(str(p))
-    if cached and cached["mtime"] == m:
-        return cached["data"]
-
-    emb = np.load(p).astype(np.float32)
+    emb = np.load(embeddings_path).astype(np.float32)
     if emb.ndim != 2:
         raise ValueError("Embeddings must be 2D (num_chunks, dim)")
-
-    _CACHE["embeddings"][str(p)] = {"mtime": m, "data": emb}
     return emb
 
 
-def retrieve_top_k(chunks_path: Path, embeddings_path: Path, query: str, top_k: int = 5, min_score=None):
-    if not query or not query.strip():
-        raise ValueError("Query cannot be empty")
-    if top_k <= 0:
-        raise ValueError("top_k must be > 0")
+def _minmax_norm(arr: np.ndarray) -> np.ndarray:
+    mn = float(np.min(arr))
+    mx = float(np.max(arr))
+    if mx - mn < 1e-9:
+        return np.zeros_like(arr, dtype=np.float32)
+    return ((arr - mn) / (mx - mn)).astype(np.float32)
 
-    chunks = load_chunks(chunks_path)
-    embeddings = load_embeddings(embeddings_path)
 
-    if len(chunks) != embeddings.shape[0]:
-        raise ValueError("Mismatch: chunks count != embeddings rows")
-
-    q = embed_query(query)
-    scores = embeddings @ q
-
-    k = min(top_k, scores.shape[0])
-    top_idx = np.argpartition(-scores, k - 1)[:k]
-    top_idx = top_idx[np.argsort(-scores[top_idx])]
-
+def _build_results(chunks: list, indices: np.ndarray, scores: np.ndarray, min_score=None):
     results = []
-    for idx in top_idx:
-        score = float(scores[idx])
-        if min_score is not None and score < min_score:
+    for idx in indices:
+        sc = float(scores[int(idx)])
+        if min_score is not None and sc < float(min_score):
             continue
-
         ch = chunks[int(idx)]
         results.append({
-            "score": score,
+            "score": sc,
             "chunk_id": ch.get("chunk_id"),
             "filename": ch.get("filename"),
             "content": ch.get("content"),
@@ -83,20 +48,81 @@ def retrieve_top_k(chunks_path: Path, embeddings_path: Path, query: str, top_k: 
                 "char_end": ch.get("char_end"),
             }
         })
-
     return results
 
 
-def cache_status():
-    return {
-        "chunks_cached": len(_CACHE["chunks"]),
-        "embeddings_cached": len(_CACHE["embeddings"]),
-    }
+def retrieve_top_k(
+    chunks_path: Path,
+    embeddings_path: Path,
+    query: str,
+    top_k: int = 5,
+    min_score=None,
+    mode: str = "hybrid",
+    alpha: float = 0.7,
+    candidate_mult: int = 5
+):
 
+    if not query or not query.strip():
+        raise ValueError("Query cannot be empty")
+    if top_k <= 0:
+        raise ValueError("top_k must be > 0")
 
-def load_meta(meta_path: Path):
-    p = Path(meta_path)
-    if not p.exists():
-        return None
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+    mode = (mode or "hybrid").lower().strip()
+    if mode not in {"hybrid", "semantic", "bm25"}:
+        raise ValueError("mode must be one of: hybrid, semantic, bm25")
+
+    chunks = load_chunks(chunks_path)
+
+    n = len(chunks)
+    if n == 0:
+        return []
+
+    bm25_norm = None
+    if mode in {"bm25", "hybrid"}:
+        bm25 = build_bm25(chunks)
+        bm25_raw = np.array(bm25_scores(bm25, query), dtype=np.float32)
+        bm25_norm = _minmax_norm(bm25_raw)
+
+    emb_norm = None
+    if mode in {"semantic", "hybrid"}:
+        embeddings = load_embeddings(embeddings_path)
+        if n != embeddings.shape[0]:
+            raise ValueError("Mismatch: chunks count != embeddings rows")
+
+        q = embed_query(query)
+        emb_scores = (embeddings @ q).astype(np.float32)
+        emb_norm = ((emb_scores + 1.0) / 2.0).clip(0.0, 1.0).astype(np.float32)
+
+    if mode == "semantic":
+        k = min(top_k, n)
+        idx = np.argpartition(-emb_norm, k - 1)[:k]
+        idx = idx[np.argsort(-emb_norm[idx])]
+        return _build_results(chunks, idx, emb_norm, min_score=min_score)
+
+    if mode == "bm25":
+        k = min(top_k, n)
+        idx = np.argpartition(-bm25_norm, k - 1)[:k]
+        idx = idx[np.argsort(-bm25_norm[idx])]
+        return _build_results(chunks, idx, bm25_norm, min_score=min_score)
+
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError("alpha must be between 0 and 1")
+    if candidate_mult <= 0:
+        raise ValueError("candidate_mult must be > 0")
+
+    k_candidates = min(n, top_k * candidate_mult)
+
+    idx_emb = np.argpartition(-emb_norm, k_candidates - 1)[:k_candidates]
+    idx_bm = np.argpartition(-bm25_norm, k_candidates - 1)[:k_candidates]
+    candidate_set = set(map(int, idx_emb)) | set(map(int, idx_bm))
+    candidate_idx = np.array(list(candidate_set), dtype=np.int32)
+
+    final_scores = alpha * emb_norm[candidate_idx] + (1.0 - alpha) * bm25_norm[candidate_idx]
+
+    order = np.argsort(-final_scores)
+    chosen = candidate_idx[order][: min(top_k, len(order))]
+
+    final_full = np.zeros((n,), dtype=np.float32)
+    final_full[candidate_idx] = final_scores.astype(np.float32)
+
+    return _build_results(chunks, chosen, final_full, min_score=min_score)

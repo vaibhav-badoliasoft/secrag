@@ -1,22 +1,44 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from pathlib import Path
+import os
 import time
 import uuid
-from fastapi import Request
+from datetime import datetime
+from pathlib import Path
+import json
+import logging
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
 from utils.uploader import process_pdf_upload
 from utils.retriever import retrieve_top_k, load_chunks
-from utils.naming import get_artifact_paths
-from utils.llm import generate_answer, generate_sample_questions
+from utils.naming import get_artifact_paths, safe_pdf_name, get_all_related_paths
+from utils.llm import generate_answer
 from utils.summarizer import summarize_from_chunks
+
+load_dotenv()
+
+logger = logging.getLogger("secrag")
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+SECRAG_API_KEY = os.getenv("SECRAG_API_KEY", "").strip()
 
 app = FastAPI()
 
+# --- Config ---
+def _parse_origins(val: str | None):
+    if not val:
+        return ["http://localhost:5173"]
+    return [o.strip().rstrip("/") for o in val.split(",") if o.strip()]
+
+ALLOWED_ORIGINS = _parse_origins(os.getenv("ALLOWED_ORIGINS"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -26,23 +48,122 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = (BASE_DIR / ".." / "data").resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+# --- Logging middleware ---
 @app.middleware("http")
-async def log_requests(request: Request, call_next):
+async def log_and_auth(request: Request, call_next):
     request_id = str(uuid.uuid4())
     start = time.time()
 
-    response = await call_next(request)
+    path = request.url.path
+
+    if SECRAG_API_KEY:
+        allowlist = {"/health", "/docs", "/openapi.json"}
+        if path not in allowlist:
+            incoming = request.headers.get("X-API-KEY", "")
+            if incoming != SECRAG_API_KEY:
+                elapsed = time.time() - start
+                logger.info(json.dumps({
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": path,
+                    "status": 401,
+                    "ms": int(elapsed * 1000),
+                    "msg": "unauthorized",
+                }))
+                raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # --- Process request ---
+    try:
+        response = await call_next(request)
+        status = response.status_code
+    except Exception as e:
+        elapsed = time.time() - start
+        logger.info(json.dumps({
+            "request_id": request_id,
+            "method": request.method,
+            "path": path,
+            "status": 500,
+            "ms": int(elapsed * 1000),
+            "error": str(e),
+        }))
+        raise
 
     elapsed = time.time() - start
-    print(f"[{request_id}] {request.method} {request.url.path} -> {response.status_code} in {elapsed:.4f}s")
+    logger.info(json.dumps({
+        "request_id": request_id,
+        "method": request.method,
+        "path": path,
+        "status": status,
+        "ms": int(elapsed * 1000),
+    }))
 
     response.headers["X-Request-ID"] = request_id
     response.headers["X-Process-Time"] = f"{elapsed:.4f}"
     return response
 
+# --- Helpers ---
+def normalize_pdf_filename(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="filename cannot be empty")
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+    return name
+
+
+def safe_file_write(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+
+
+def artifact_stats_for_pdf(pdf_name: str):
+    chunk_path, emb_path = get_artifact_paths(pdf_name, DATA_DIR)
+
+    if not chunk_path.exists() or not emb_path.exists():
+        raise HTTPException(status_code=404, detail="Artifacts not found. Upload PDF first.")
+
+    chunks = load_chunks(chunk_path)
+    emb_size = emb_path.stat().st_size
+    chunk_size = chunk_path.stat().st_size
+
+    last_ingested_ts = max(chunk_path.stat().st_mtime, emb_path.stat().st_mtime)
+    last_ingested = datetime.fromtimestamp(last_ingested_ts).isoformat()
+
+    import numpy as np
+    emb = np.load(emb_path)
+    dim = int(emb.shape[1]) if emb.ndim == 2 else 0
+
+    return {
+        "filename": pdf_name,
+        "total_chunks": len(chunks),
+        "embedding_dim": dim,
+        "artifacts": {
+            "chunks_path": str(chunk_path),
+            "chunks_bytes": int(chunk_size),
+            "embedding_path": str(emb_path),
+            "embedding_bytes": int(emb_size),
+        },
+        "last_ingested": last_ingested,
+    }
+
+
+# --- Endpoints ---
 @app.get("/health")
 def health_check():
-    return {"status": "SecRAG backend is running"}
+    return {"status": "SecRAG backend is running", "allowed_origins": ALLOWED_ORIGINS}
+
+
+@app.get("/list_docs")
+def list_docs():
+    pdfs = [f.name for f in DATA_DIR.glob("*.pdf")]
+    return {"documents": pdfs}
+
+
+@app.get("/stats")
+def stats(filename: str):
+    pdf_name = normalize_pdf_filename(filename)
+    return artifact_stats_for_pdf(pdf_name)
+
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -50,13 +171,20 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     contents = await file.read()
+
+    if len(contents) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Max allowed is {MAX_UPLOAD_MB} MB."
+        )
+
     pdf_path = DATA_DIR / file.filename
 
     try:
-        pdf_path.write_bytes(contents)
+        safe_file_write(pdf_path, contents)
         return process_pdf_upload(str(pdf_path), str(DATA_DIR))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Upload processing failed: {e}")
 
 
 class RetrieveRequest(BaseModel):
@@ -67,16 +195,12 @@ class RetrieveRequest(BaseModel):
     mode: str = "hybrid"
     alpha: float = 0.7
 
+
 @app.post("/retrieve")
 def retrieve(req: RetrieveRequest):
-    filename = req.filename.strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename cannot be empty")
+    pdf_name = normalize_pdf_filename(req.filename)
 
-    if not filename.lower().endswith(".pdf"):
-        filename += ".pdf"
-
-    chunk_path, emb_path, _meta_path = get_artifact_paths(filename, DATA_DIR)
+    chunk_path, emb_path = get_artifact_paths(pdf_name, DATA_DIR)
 
     if not chunk_path.exists():
         raise HTTPException(status_code=404, detail="Chunks file not found. Upload PDF first.")
@@ -93,8 +217,7 @@ def retrieve(req: RetrieveRequest):
             mode=req.mode,
             alpha=req.alpha
         )
-
-        return {"filename": filename, "query": req.query, "top_k": req.top_k, "results": results}
+        return {"filename": pdf_name, "query": req.query, "top_k": req.top_k, "mode": req.mode, "results": results}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -109,16 +232,12 @@ class AnswerRequest(BaseModel):
     mode: str = "hybrid"
     alpha: float = 0.7
 
+
 @app.post("/answer")
 def answer(req: AnswerRequest):
-    filename = req.filename.strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename cannot be empty")
+    pdf_name = normalize_pdf_filename(req.filename)
 
-    if not filename.lower().endswith(".pdf"):
-        filename += ".pdf"
-
-    chunk_path, emb_path, _meta_path = get_artifact_paths(filename, DATA_DIR)
+    chunk_path, emb_path = get_artifact_paths(pdf_name, DATA_DIR)
 
     if not chunk_path.exists() or not emb_path.exists():
         raise HTTPException(status_code=404, detail="Artifacts not found. Upload PDF first.")
@@ -135,26 +254,24 @@ def answer(req: AnswerRequest):
         )
 
         if not retrieved:
-            return {"filename": filename, "query": req.query, "answer": "No relevant context found.", "citations": []}
+            return {"filename": pdf_name, "query": req.query, "answer": "No relevant context found.", "citations": []}
 
         answer_text = generate_answer(req.query, retrieved)
 
-        citations = []
-        for c in retrieved:
-            content = c.get("content", "") or ""
-            citations.append({
-                "chunk_id": c.get("chunk_id"),
-                "score": c.get("score"),
-                "char_range": [c["metadata"]["char_start"], c["metadata"]["char_end"]],
-                "preview": content[:240]
-            })
-
         return {
-            "filename": filename,
+            "filename": pdf_name,
             "query": req.query,
             "top_k": req.top_k,
+            "mode": req.mode,
             "answer": answer_text,
-            "citations": citations,
+            "citations": [
+                {
+                    "chunk_id": c["chunk_id"],
+                    "score": c["score"],
+                    "char_range": [c["metadata"]["char_start"], c["metadata"]["char_end"]],
+                }
+                for c in retrieved
+            ],
         }
 
     except ValueError as e:
@@ -169,23 +286,20 @@ class SummarizeRequest(BaseModel):
     top_k: int = 5
     max_output_tokens: int = 350
     min_score: float | None = None
+    mode: str = "hybrid"
+    alpha: float = 0.7
 
 
 @app.post("/summarize")
 def summarize(req: SummarizeRequest):
-    filename = req.filename.strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename cannot be empty")
-
-    if not filename.lower().endswith(".pdf"):
-        filename += ".pdf"
+    pdf_name = normalize_pdf_filename(req.filename)
 
     if req.intro_chunks <= 0 or req.intro_chunks > 10:
         raise HTTPException(status_code=400, detail="intro_chunks must be between 1 and 10")
     if req.top_k <= 0 or req.top_k > 20:
         raise HTTPException(status_code=400, detail="top_k must be between 1 and 20")
 
-    chunk_path, emb_path, _meta_path = get_artifact_paths(filename, DATA_DIR)
+    chunk_path, emb_path = get_artifact_paths(pdf_name, DATA_DIR)
 
     if not chunk_path.exists() or not emb_path.exists():
         raise HTTPException(status_code=404, detail="Artifacts not found. Upload PDF first.")
@@ -199,7 +313,9 @@ def summarize(req: SummarizeRequest):
             embeddings_path=emb_path,
             query="Summarize this document.",
             top_k=req.top_k,
-            min_score=req.min_score
+            min_score=req.min_score,
+            mode=req.mode,
+            alpha=req.alpha
         )
 
         merged = {}
@@ -212,10 +328,7 @@ def summarize(req: SummarizeRequest):
                 "chunk_id": cid,
                 "content": c.get("content", ""),
                 "score": 0.0,
-                "metadata": {
-                    "char_start": c.get("char_start"),
-                    "char_end": c.get("char_end"),
-                },
+                "metadata": {"char_start": c.get("char_start"), "char_end": c.get("char_end")},
                 "source": "intro"
             }
 
@@ -251,32 +364,29 @@ def summarize(req: SummarizeRequest):
         final_chunks = [merged[cid] for cid in final_ids if cid in merged]
 
         if not final_chunks:
-            return {"filename": filename, "summary": "I do not know.", "citations": []}
+            return {"filename": pdf_name, "summary": "I do not know.", "citations": []}
 
         summary_text = summarize_from_chunks(
-            filename=filename,
+            filename=pdf_name,
             chunks=final_chunks,
             max_output_tokens=req.max_output_tokens
         )
 
-        citations = []
-        for c in final_chunks:
-            content = c.get("content", "") or ""
-            citations.append({
+        citations = [
+            {
                 "chunk_id": c["chunk_id"],
                 "score": c.get("score", 0.0),
                 "source": c.get("source", ""),
-                "char_range": [
-                    c.get("metadata", {}).get("char_start"),
-                    c.get("metadata", {}).get("char_end"),
-                ],
-                "preview": content[:240]
-            })
+                "char_range": [c.get("metadata", {}).get("char_start"), c.get("metadata", {}).get("char_end")],
+            }
+            for c in final_chunks
+        ]
 
         return {
-            "filename": filename,
+            "filename": pdf_name,
             "intro_chunks": req.intro_chunks,
             "top_k": req.top_k,
+            "mode": req.mode,
             "summary": summary_text,
             "citations": citations
         }
@@ -284,121 +394,30 @@ def summarize(req: SummarizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Summarize failed: {e}")
 
+@app.delete("/documents/{filename}")
+def delete_document(filename: str):
+    pdf_name = safe_pdf_name(filename)
 
-@app.get("/list_docs")
-def list_docs():
-    pdfs = [f.name for f in DATA_DIR.glob("*.pdf")]
-    return {"documents": pdfs}
+    paths = get_all_related_paths(pdf_name, DATA_DIR)
 
+    deleted = []
+    missing = []
 
-@app.get("/stats")
-def stats(filename: str):
-    filename = (filename or "").strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename cannot be empty")
-    if not filename.lower().endswith(".pdf"):
-        filename += ".pdf"
-
-    chunk_path, emb_path, meta_path = get_artifact_paths(filename, DATA_DIR)
-
-    if not chunk_path.exists() or not emb_path.exists():
-        raise HTTPException(status_code=404, detail="Artifacts not found. Upload PDF first.")
-
-    meta = load_meta(meta_path) or {}
-
-    embedding_dim = meta.get("embedding_dim")
-    total_chunks = meta.get("total_chunks")
-    created_at = meta.get("created_at")
-
-    if total_chunks is None:
+    for p in paths:
         try:
-            total_chunks = len(load_chunks(chunk_path))
-        except Exception:
-            total_chunks = None
+            if p.exists() and p.is_file():
+                p.unlink()
+                deleted.append(p.name)
+            else:
+                missing.append(p.name)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete {p.name}: {e}")
 
     return {
-        "filename": filename,
-        "total_chunks": total_chunks,
-        "embedding_dim": embedding_dim,
-        "last_ingested_at": created_at,
-        "cache": cache_status(),
-        "artifacts": {
-            "chunks": chunk_path.name,
-            "embedding": emb_path.name,
-            "meta": meta_path.name if meta_path.exists() else None,
-        }
+        "filename": pdf_name,
+        "deleted": deleted,
+        "missing": missing,
     }
 
-class SampleQuestionsRequest(BaseModel):
-    filename: str
-    intro_chunks: int = 2
-    top_k: int = 4
-    max_output_tokens: int = 220
-    min_score: float | None = None
-
-@app.post("/sample_questions")
-def sample_questions(req: SampleQuestionsRequest):
-    filename = req.filename.strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename cannot be empty")
-    if not filename.lower().endswith(".pdf"):
-        filename += ".pdf"
-
-    if req.intro_chunks <= 0 or req.intro_chunks > 10:
-        raise HTTPException(status_code=400, detail="intro_chunks must be between 1 and 10")
-    if req.top_k <= 0 or req.top_k > 20:
-        raise HTTPException(status_code=400, detail="top_k must be between 1 and 20")
-
-    chunk_path, emb_path, _meta_path = get_artifact_paths(filename, DATA_DIR)
-    if not chunk_path.exists() or not emb_path.exists():
-        raise HTTPException(status_code=404, detail="Artifacts not found. Upload PDF first.")
-
-    try:
-        all_chunks = load_chunks(chunk_path)
-        intro = all_chunks[: req.intro_chunks]
-
-        retrieved = retrieve_top_k(
-            chunks_path=chunk_path,
-            embeddings_path=emb_path,
-            query="What are the main topics of this document?",
-            top_k=req.top_k,
-            min_score=req.min_score
-        )
-
-        merged = []
-        seen = set()
-
-        for c in intro:
-            cid = c.get("chunk_id")
-            if cid is None or cid in seen:
-                continue
-            seen.add(cid)
-            merged.append({"chunk_id": cid, "content": c.get("content", "")})
-
-        for r in retrieved:
-            cid = r.get("chunk_id")
-            if cid is None or cid in seen:
-                continue
-            seen.add(cid)
-            merged.append({"chunk_id": cid, "content": r.get("content", "")})
-
-        context = "\n\n".join(
-            f"[Chunk {c['chunk_id']}]\n{c['content']}"
-            for c in merged
-        )
-
-        qs = generate_sample_questions(
-            filename=filename,
-            context=context,
-            max_output_tokens=req.max_output_tokens
-        )
-
-        qs = [q.strip() for q in qs if isinstance(q, str) and q.strip()]
-        return {"filename": filename, "questions": qs[:6]}
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))

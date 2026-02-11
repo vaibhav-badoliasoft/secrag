@@ -3,76 +3,94 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 const API_BASE =
   import.meta.env.VITE_API_BASE?.replace(/\/+$/, "") || "http://localhost:8000";
 
-function confidenceFromScore(score) {
-  if (score >= 0.6) return { label: "High", tone: "text-green-700" };
-  if (score >= 0.45) return { label: "Medium", tone: "text-yellow-700" };
-  return { label: "Low", tone: "text-red-700" };
+const API_KEY = import.meta.env.VITE_API_KEY || "";
+
+function authHeaders(extra = {}) {
+  return API_KEY ? { ...extra, "X-API-KEY": API_KEY } : extra;
 }
 
-function prettyFile(name) {
-  return name || "";
+function confidenceFromScore(score) {
+  if (score >= 0.6) return { label: "High", tone: "text-green-700 dark:text-green-400" };
+  if (score >= 0.45) return { label: "Medium", tone: "text-yellow-700 dark:text-yellow-400" };
+  return { label: "Low", tone: "text-red-700 dark:text-red-400" };
 }
 
 export default function App() {
   const [backendStatus, setBackendStatus] = useState("Checking...");
   const [docs, setDocs] = useState([]);
   const [selectedDoc, setSelectedDoc] = useState("");
+
   const [uploading, setUploading] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [sending, setSending] = useState(false);
 
-  const [fileToUpload, setFileToUpload] = useState(null);
-
-  // Day 10: retrieval mode toggle
   const [retrievalMode, setRetrievalMode] = useState("hybrid");
-
-  const [messages, setMessages] = useState([
-    {
-      id: crypto.randomUUID(),
-      role: "user",
-      text: "What is this document about?",
-      meta: { doc: "" },
-    },
-  ]);
-
+  const [fileToUpload, setFileToUpload] = useState(null);
   const [input, setInput] = useState("");
 
-  const chatEndRef = useRef(null);
+  const [messages, setMessages] = useState([]);
 
+  // Dark mode (persisted)
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem("secrag_dark");
+    return saved === "1";
+  });
+
+  // Delete modal state
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+
+  const chatEndRef = useRef(null);
   const hasSelectedDoc = useMemo(() => !!selectedDoc, [selectedDoc]);
+
+  useEffect(() => {
+    localStorage.setItem("secrag_dark", darkMode ? "1" : "0");
+    document.documentElement.classList.toggle("dark", darkMode);
+  }, [darkMode]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  async function checkHealth() {
-    try {
-      const res = await fetch(`${API_BASE}/health`);
-      if (!res.ok) throw new Error("Health check failed");
-      const data = await res.json();
-      setBackendStatus(data?.status || "OK");
-    } catch (e) {
-      setBackendStatus("Backend not reachable");
-    }
-  }
-
-  async function refreshDocs(selectFirstIfEmpty = false) {
-    try {
-      const res = await fetch(`${API_BASE}/list_docs`);
-      const data = await res.json();
-      const list = Array.isArray(data?.documents) ? data.documents : [];
-      setDocs(list);
-
-      if (selectFirstIfEmpty && !selectedDoc && list.length > 0) {
-        setSelectedDoc(list[0]);
-      }
-    } catch (e) {}
-  }
-
   useEffect(() => {
     checkHealth();
     refreshDocs(true);
   }, []);
+
+  function pushSystem(text) {
+    setMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: "system", text },
+    ]);
+  }
+
+  async function checkHealth() {
+    try {
+      const res = await fetch(`${API_BASE}/health`);
+      if (!res.ok) throw new Error();
+      setBackendStatus("Connected");
+    } catch {
+      setBackendStatus("Backend unreachable");
+    }
+  }
+
+  async function refreshDocs(selectFirst = false) {
+    try {
+      const res = await fetch(`${API_BASE}/list_docs`, {
+        headers: authHeaders(),
+      });
+      const data = await res.json().catch(() => ({}));
+      const list = Array.isArray(data?.documents) ? data.documents : [];
+      setDocs(list);
+
+      if (selectFirst && !selectedDoc && list.length > 0) {
+        setSelectedDoc(list[0]);
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
 
   async function handleUpload() {
     if (!fileToUpload) return;
@@ -84,42 +102,24 @@ export default function App() {
 
       const res = await fetch(`${API_BASE}/upload`, {
         method: "POST",
+        headers: authHeaders(),
         body: form,
       });
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.detail || "Upload failed");
-      }
-
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail || "Upload failed");
 
       await refreshDocs(false);
-      setSelectedDoc(data?.filename || selectedDoc);
+      setSelectedDoc(data?.filename || "");
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "system",
-          text: `Uploaded: ${data?.filename} • chunks: ${data?.total_chunks} • dim: ${data?.embedding_dim}`,
-          meta: { type: "upload", doc: data?.filename || "" },
-        },
-      ]);
-
-      setFileToUpload(null);
+      pushSystem(
+        `Uploaded ${data.filename} • ${data.total_chunks} chunks • ${data.embedding_dim} dim`
+      );
     } catch (e) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "system",
-          text: `Upload error: ${e.message}`,
-          meta: { type: "error" },
-        },
-      ]);
+      pushSystem(`Upload error: ${e.message}`);
     } finally {
       setUploading(false);
+      setFileToUpload(null);
     }
   }
 
@@ -128,33 +128,24 @@ export default function App() {
     if (!q) return;
 
     if (!selectedDoc) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "system",
-          text: "Select a document first.",
-          meta: { type: "error" },
-        },
-      ]);
+      pushSystem("Select a document first.");
       return;
     }
 
-    const userMsg = {
-      id: crypto.randomUUID(),
-      role: "user",
-      text: q,
-      meta: { doc: selectedDoc },
-    };
+    setMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: "user", text: q },
+    ]);
 
-    setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setSending(true);
 
     try {
       const res = await fetch(`${API_BASE}/answer`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({
+          "Content-Type": "application/json",
+        }),
         body: JSON.stringify({
           filename: selectedDoc,
           query: q,
@@ -164,12 +155,8 @@ export default function App() {
         }),
       });
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.detail || "Answer failed");
-      }
-
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail || "Answer failed");
 
       const topScore =
         Array.isArray(data?.citations) && data.citations.length > 0
@@ -178,32 +165,18 @@ export default function App() {
 
       const conf = confidenceFromScore(topScore);
 
-      const assistantMsg = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: data?.answer || "",
-        meta: {
-          type: "answer",
-          doc: selectedDoc,
-          confidence: conf,
-          topScore,
-          citations: data?.citations || [],
-          expanded: false,
-          mode: retrievalMode,
-        },
-      };
-
-      setMessages((prev) => [...prev, assistantMsg]);
-    } catch (e) {
       setMessages((prev) => [
         ...prev,
         {
           id: crypto.randomUUID(),
-          role: "system",
-          text: `Answer error: ${e.message}`,
-          meta: { type: "error" },
+          role: "assistant",
+          text: data.answer || "",
+          confidence: conf,
+          citations: data.citations || [],
         },
       ]);
+    } catch (e) {
+      pushSystem(`Answer error: ${e.message}`);
     } finally {
       setSending(false);
     }
@@ -211,15 +184,7 @@ export default function App() {
 
   async function handleSummarize() {
     if (!selectedDoc) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "system",
-          text: "Select a document first.",
-          meta: { type: "error" },
-        },
-      ]);
+      pushSystem("Select a document first.");
       return;
     }
 
@@ -227,292 +192,241 @@ export default function App() {
 
     setMessages((prev) => [
       ...prev,
-      {
-        id: crypto.randomUUID(),
-        role: "user",
-        text: "Summarize this document.",
-        meta: { doc: selectedDoc },
-      },
+      { id: crypto.randomUUID(), role: "user", text: "Summarize this document." },
     ]);
 
     try {
       const res = await fetch(`${API_BASE}/summarize`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({
+          "Content-Type": "application/json",
+        }),
         body: JSON.stringify({
           filename: selectedDoc,
           intro_chunks: 3,
           top_k: 5,
           max_output_tokens: 350,
+          mode: retrievalMode,
+          alpha: 0.7,
         }),
       });
 
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err?.detail || "Summarize failed");
-      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail || "Summarize failed");
 
-      const data = await res.json();
-
-      const assistantMsg = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        text: data?.summary || "",
-        meta: {
-          type: "summary",
-          doc: selectedDoc,
-          citations: data?.citations || [],
-          expanded: false,
-        },
-      };
-
-      setMessages((prev) => [...prev, assistantMsg]);
-    } catch (e) {
       setMessages((prev) => [
         ...prev,
         {
           id: crypto.randomUUID(),
-          role: "system",
-          text: `Summarize error: ${e.message}`,
-          meta: { type: "error" },
+          role: "assistant",
+          text: data.summary || "",
+          citations: data.citations || [],
         },
       ]);
+    } catch (e) {
+      pushSystem(`Summarize error: ${e.message}`);
     } finally {
       setSummarizing(false);
     }
   }
 
-  function toggleSources(id) {
-    setMessages((prev) =>
-      prev.map((m) => {
-        if (m.id !== id) return m;
-        return { ...m, meta: { ...m.meta, expanded: !m.meta?.expanded } };
-      })
-    );
+  async function handleDeleteSelectedConfirmed() {
+    if (!selectedDoc) return;
+
+    setDeleting(true);
+    setDeleteError("");
+
+    try {
+      const res = await fetch(
+        `${API_BASE}/documents/${encodeURIComponent(selectedDoc)}`,
+        {
+          method: "DELETE",
+          headers: authHeaders(),
+        }
+      );
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.detail || "Delete failed");
+
+      pushSystem(
+        `Deleted "${selectedDoc}" • removed ${data?.deleted?.length || 0} file(s)`
+      );
+
+      await refreshDocs(false);
+      setSelectedDoc("");
+      setShowDeleteModal(false);
+    } catch (e) {
+      setDeleteError(e.message);
+    } finally {
+      setDeleting(false);
+    }
   }
 
   function clearChat() {
     setMessages([]);
   }
 
-  function copyText(text) {
-    if (!text) return;
-    navigator.clipboard?.writeText(text).catch(() => {});
-  }
-
   return (
-    <div className="h-screen w-screen flex bg-gray-50 text-gray-900">
-      <aside className="w-[320px] border-r bg-white p-4 flex flex-col gap-4">
-        <div>
-          <div className="text-xl font-semibold">SecRAG</div>
-          <div className="text-sm text-gray-500">
-            Day 10 — Sentence Chunking + Hybrid Retrieval
+    <div className="h-screen flex bg-gray-50 text-gray-900 dark:bg-zinc-950 dark:text-zinc-100">
+      {/* LEFT SIDEBAR */}
+      <aside className="w-[320px] border-r bg-white p-4 space-y-4 dark:bg-zinc-900 dark:border-zinc-800">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h1 className="text-xl font-semibold">SecRAG</h1>
+            <p className="text-xs text-gray-500 dark:text-zinc-400">
+              Day 11 — Production Ready
+            </p>
+            <p className="text-xs text-gray-600 dark:text-zinc-300 mt-2">
+              Backend: <span className="font-medium">{backendStatus}</span>
+            </p>
           </div>
+
+          <button
+            className="text-xs px-3 py-2 rounded border bg-gray-50 hover:bg-gray-100 dark:bg-zinc-800 dark:border-zinc-700 dark:hover:bg-zinc-700"
+            onClick={() => setDarkMode((v) => !v)}
+            title="Toggle dark mode"
+          >
+            {darkMode ? "Light" : "Dark"}
+          </button>
         </div>
 
-        <div className="text-sm text-gray-600">
-          Backend: <span className="font-mono">{API_BASE}</span>
+        <div>
+          <label className="text-sm font-medium">Retrieval Mode</label>
+          <select
+            value={retrievalMode}
+            onChange={(e) => setRetrievalMode(e.target.value)}
+            className="w-full mt-1 border rounded p-2 text-sm bg-white dark:bg-zinc-900 dark:border-zinc-700"
+          >
+            <option value="hybrid">Hybrid</option>
+            <option value="semantic">Semantic</option>
+            <option value="bm25">BM25</option>
+          </select>
         </div>
 
-        <div className="text-xs text-gray-500">
-          Status: <span className="font-medium">{backendStatus}</span>
-        </div>
-
-        <div className="border rounded-lg p-3 bg-gray-50">
-          <div className="font-medium mb-2">Upload PDF</div>
+        <div className="border rounded p-3 bg-gray-50 dark:bg-zinc-800 dark:border-zinc-700">
+          <div className="text-sm font-medium mb-2">Upload PDF</div>
           <input
             type="file"
             accept="application/pdf"
             onChange={(e) => setFileToUpload(e.target.files?.[0] || null)}
+            className="text-sm"
           />
           <button
-            className="mt-2 w-full rounded-md bg-black text-white py-2 disabled:opacity-50"
             onClick={handleUpload}
             disabled={!fileToUpload || uploading}
+            className="mt-2 w-full bg-black text-white py-2 rounded disabled:opacity-50 dark:bg-white dark:text-black"
           >
             {uploading ? "Uploading..." : "Upload"}
           </button>
         </div>
 
-        <div className="border rounded-lg p-3 bg-white">
-          <div className="flex items-center justify-between mb-2">
-            <div className="font-medium">Documents</div>
-            <button
-              className="text-sm px-2 py-1 rounded border bg-gray-50"
-              onClick={() => refreshDocs(false)}
-            >
-              Refresh
-            </button>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-medium">Documents</h2>
+
+            {/* Document count badge */}
+            <span className="text-xs px-2 py-1 rounded-full border bg-gray-50 dark:bg-zinc-800 dark:border-zinc-700">
+              {docs.length}
+            </span>
           </div>
 
-          <div className="max-h-[260px] overflow-auto border rounded">
+          <div className="max-h-[240px] overflow-auto border rounded bg-white dark:bg-zinc-900 dark:border-zinc-700">
             {docs.length === 0 ? (
-              <div className="p-3 text-sm text-gray-500">No documents yet.</div>
+              <div className="p-3 text-sm text-gray-500 dark:text-zinc-400">
+                No documents yet. Upload a PDF.
+              </div>
             ) : (
               docs.map((d) => (
                 <button
                   key={d}
                   onClick={() => setSelectedDoc(d)}
-                  className={`w-full text-left px-3 py-2 border-b last:border-b-0 hover:bg-gray-50 ${
-                    selectedDoc === d ? "bg-gray-100 font-medium" : ""
-                  }`}
+                  className={`block w-full text-left px-3 py-2 text-sm border-b last:border-b-0
+                    dark:border-zinc-800 hover:bg-gray-50 dark:hover:bg-zinc-800
+                    ${selectedDoc === d ? "bg-gray-100 dark:bg-zinc-800 font-medium" : ""}`}
                 >
-                  {prettyFile(d)}
+                  {d}
                 </button>
               ))
             )}
           </div>
 
-          <div className="mt-2 text-xs text-gray-500">
-            Selected:{" "}
-            <span className="font-medium">{selectedDoc || "None"}</span>
+          <div className="text-xs text-gray-500 dark:text-zinc-400">
+            Selected: <span className="font-medium">{selectedDoc || "None"}</span>
           </div>
+        </div>
 
-          {/* Day 10: retrieval mode selector */}
-          <div className="mt-3">
-            <div className="text-sm font-medium mb-1">Retrieval mode</div>
-            <select
-              className="w-full border rounded-md px-3 py-2 bg-white"
-              value={retrievalMode}
-              onChange={(e) => setRetrievalMode(e.target.value)}
-            >
-              <option value="hybrid">Hybrid (BM25 + Embeddings)</option>
-              <option value="semantic">Semantic (Embeddings only)</option>
-              <option value="bm25">Keyword (BM25 only)</option>
-            </select>
-            <div className="mt-1 text-xs text-gray-500">
-              Current: <span className="font-medium">{retrievalMode}</span>
-            </div>
-          </div>
+        <button
+          onClick={handleSummarize}
+          disabled={!hasSelectedDoc || summarizing}
+          className="w-full border rounded py-2 text-sm bg-white disabled:opacity-50 hover:bg-gray-50
+                     dark:bg-zinc-900 dark:border-zinc-700 dark:hover:bg-zinc-800"
+        >
+          {summarizing ? "Summarizing..." : "Summarize Document"}
+        </button>
 
+        <button
+          onClick={() => {
+            if (!selectedDoc) return;
+            setDeleteError("");
+            setShowDeleteModal(true);
+          }}
+          disabled={!selectedDoc}
+          className="w-full border rounded py-2 text-sm bg-white disabled:opacity-50 hover:bg-gray-50
+                     dark:bg-zinc-900 dark:border-zinc-700 dark:hover:bg-zinc-800"
+        >
+          Delete Selected Document
+        </button>
+
+        <div className="flex gap-2">
           <button
-            className="mt-3 w-full rounded-md border bg-white py-2 disabled:opacity-50"
-            onClick={handleSummarize}
-            disabled={!hasSelectedDoc || summarizing}
+            onClick={clearChat}
+            className="flex-1 border rounded py-2 text-sm bg-white hover:bg-gray-50
+                       dark:bg-zinc-900 dark:border-zinc-700 dark:hover:bg-zinc-800"
           >
-            {summarizing ? "Summarizing..." : "Summarize document"}
+            Clear Chat
           </button>
 
-          <div className="mt-3 flex gap-2">
-            <button
-              className="flex-1 rounded-md border bg-white py-2 text-sm"
-              onClick={clearChat}
-            >
-              Clear chat
-            </button>
-            <button
-              className="flex-1 rounded-md border bg-white py-2 text-sm"
-              onClick={() =>
-                setInput("What is this document about? Give a short answer.")
-              }
-            >
-              Sample
-            </button>
-          </div>
+          <button
+            onClick={() => refreshDocs(false)}
+            className="flex-1 border rounded py-2 text-sm bg-white hover:bg-gray-50
+                       dark:bg-zinc-900 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          >
+            Refresh
+          </button>
         </div>
       </aside>
 
+      {/* MAIN */}
       <main className="flex-1 flex flex-col">
-        <header className="h-14 border-b bg-white px-6 flex items-center justify-between">
+        <header className="h-14 border-b bg-white px-6 flex items-center justify-between dark:bg-zinc-900 dark:border-zinc-800">
           <div className="font-medium">Chat</div>
-          <div className="text-sm text-gray-500">
+          <div className="text-sm text-gray-500 dark:text-zinc-400">
             {sending ? "Thinking..." : "Ready"}
           </div>
         </header>
 
         <section className="flex-1 overflow-auto p-6 space-y-4">
           {messages.length === 0 ? (
-            <div className="text-sm text-gray-500">
-              Ask a question or click “Summarize document”.
+            <div className="text-sm text-gray-500 dark:text-zinc-400">
+              Upload/select a document, then ask a question or click “Summarize Document”.
             </div>
           ) : (
             messages.map((m) => (
               <div
                 key={m.id}
-                className={`max-w-3xl ${
-                  m.role === "user" ? "ml-auto" : "mr-auto"
-                }`}
+                className={`max-w-3xl ${m.role === "user" ? "ml-auto" : "mr-auto"}`}
               >
-                <div className="text-xs text-gray-500 mb-1">
-                  {m.role === "user"
-                    ? "You"
-                    : m.role === "assistant"
-                    ? "SecRAG"
-                    : "System"}
-                  {m.meta?.doc ? ` • ${m.meta.doc}` : ""}
-                  {m.meta?.type === "answer" && (
-                    <>
-                      {" "}
-                      • Mode:{" "}
-                      <span className="font-medium">
-                        {m.meta?.mode || retrievalMode}
-                      </span>
-                      {" "}
-                      • Confidence:{" "}
-                      <span className={m.meta.confidence?.tone || ""}>
-                        {m.meta.confidence?.label || "Low"}{" "}
-                        {typeof m.meta.topScore === "number"
-                          ? `(top score ${m.meta.topScore.toFixed(3)})`
-                          : ""}
-                      </span>
-                    </>
+                <div className="text-xs text-gray-500 dark:text-zinc-400 mb-1">
+                  {m.role === "user" ? "You" : m.role === "assistant" ? "SecRAG" : "System"}
+                  {m.confidence && (
+                    <span className={`ml-2 ${m.confidence.tone}`}>
+                      Confidence: {m.confidence.label}
+                    </span>
                   )}
-                  {m.meta?.type === "summary" && <> • Summary</>}
                 </div>
 
-                <div className="rounded-lg border bg-white p-4 shadow-sm">
-                  <div className="whitespace-pre-wrap leading-relaxed">
-                    {m.text}
-                  </div>
-
-                  {m.role === "assistant" && (
-                    <div className="mt-3 flex gap-2">
-                      <button
-                        className="text-sm px-3 py-1 rounded border bg-gray-50"
-                        onClick={() => copyText(m.text)}
-                      >
-                        Copy
-                      </button>
-
-                      {(m.meta?.citations?.length || 0) > 0 && (
-                        <button
-                          className="text-sm px-3 py-1 rounded border bg-gray-50"
-                          onClick={() => toggleSources(m.id)}
-                        >
-                          {m.meta?.expanded
-                            ? "Hide Sources"
-                            : `Sources (${m.meta.citations.length})`}
-                        </button>
-                      )}
-                    </div>
-                  )}
-
-                  {m.role === "assistant" &&
-                    m.meta?.expanded &&
-                    (m.meta?.citations?.length || 0) > 0 && (
-                      <div className="mt-3 border-t pt-3 space-y-2">
-                        {m.meta.citations.map((c, idx) => (
-                          <div
-                            key={`${m.id}-${idx}`}
-                            className="rounded-md border bg-gray-50 p-3 text-sm"
-                          >
-                            <div className="font-medium">
-                              Chunk {c.chunk_id ?? "?"}
-                              {typeof c.score === "number"
-                                ? ` • score ${c.score.toFixed(3)}`
-                                : ""}
-                              {c.source ? ` • ${c.source}` : ""}
-                            </div>
-                            {Array.isArray(c.char_range) &&
-                              c.char_range.length === 2 && (
-                                <div className="text-xs text-gray-600">
-                                  char range: {c.char_range[0]}–{c.char_range[1]}
-                                </div>
-                              )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                <div className="bg-white p-3 rounded border whitespace-pre-wrap dark:bg-zinc-900 dark:border-zinc-800">
+                  {m.text}
                 </div>
               </div>
             ))
@@ -520,33 +434,77 @@ export default function App() {
           <div ref={chatEndRef} />
         </section>
 
-        <footer className="border-t bg-white p-4">
-          <div className="max-w-4xl mx-auto flex gap-3">
-            <textarea
-              className="flex-1 border rounded-lg p-3 resize-none h-[52px] focus:outline-none focus:ring-2 focus:ring-black/20"
-              placeholder="Ask a question about the selected PDF..."
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  if (!sending) handleSend();
-                }
-              }}
-            />
-            <button
-              className="w-[110px] rounded-lg bg-black text-white disabled:opacity-50"
-              onClick={handleSend}
-              disabled={sending || !selectedDoc}
-            >
-              {sending ? "..." : "Send"}
-            </button>
-          </div>
-          <div className="max-w-4xl mx-auto text-xs text-gray-500 mt-2">
-            Tip: Enter to send • Shift+Enter for newline
-          </div>
+        <footer className="border-t p-4 flex gap-2 bg-white dark:bg-zinc-900 dark:border-zinc-800">
+          <textarea
+            className="flex-1 border rounded p-2 resize-none bg-white dark:bg-zinc-950 dark:border-zinc-700"
+            placeholder="Ask a question..."
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (!sending) handleSend();
+              }
+            }}
+          />
+          <button
+            onClick={handleSend}
+            disabled={!selectedDoc || sending}
+            className="bg-black text-white px-5 rounded disabled:opacity-50 dark:bg-white dark:text-black"
+          >
+            Send
+          </button>
         </footer>
       </main>
+
+      {/* DELETE MODAL */}
+      {showDeleteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => !deleting && setShowDeleteModal(false)}
+          />
+
+          <div className="relative w-[92%] max-w-md rounded-xl border bg-white p-5 shadow-lg dark:bg-zinc-900 dark:border-zinc-700">
+            <div className="text-lg font-semibold">Delete document?</div>
+
+            <div className="mt-2 text-sm text-gray-600 dark:text-zinc-300">
+              You are about to delete:
+              <div className="mt-2 rounded-lg border bg-gray-50 px-3 py-2 font-medium dark:bg-zinc-800 dark:border-zinc-700">
+                {selectedDoc}
+              </div>
+              <div className="mt-2 text-xs text-gray-500 dark:text-zinc-400">
+                This removes the PDF and generated artifacts (chunks/embeddings/text). This cannot be undone.
+              </div>
+            </div>
+
+            {deleteError && (
+              <div className="mt-3 rounded-lg border border-red-300 bg-red-50 p-3 text-sm text-red-700 dark:border-red-700 dark:bg-red-950 dark:text-red-300">
+                {deleteError}
+              </div>
+            )}
+
+            <div className="mt-5 flex gap-2 justify-end">
+              <button
+                className="rounded-lg border px-4 py-2 text-sm bg-white hover:bg-gray-50 disabled:opacity-50
+                           dark:bg-zinc-900 dark:border-zinc-700 dark:hover:bg-zinc-800"
+                onClick={() => setShowDeleteModal(false)}
+                disabled={deleting}
+              >
+                Cancel
+              </button>
+
+              <button
+                className="rounded-lg bg-red-600 px-4 py-2 text-sm text-white hover:bg-red-700 disabled:opacity-50"
+                onClick={handleDeleteSelectedConfirmed}
+                disabled={deleting}
+              >
+                {deleting ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

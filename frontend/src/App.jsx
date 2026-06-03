@@ -16,7 +16,7 @@ function confidenceFromScore(score) {
 }
 
 export default function App() {
-  const [backendStatus, setBackendStatus] = useState("Checking...");
+  const [backendStatus, setBackendStatus] = useState("Connecting...");
   const [docs, setDocs] = useState([]);
   const [selectedDoc, setSelectedDoc] = useState("");
 
@@ -66,14 +66,16 @@ export default function App() {
   }
 
   async function checkHealth() {
-    try {
-      const res = await fetch(`${API_BASE}/health`);
-      if (!res.ok) throw new Error();
-      setBackendStatus("Connected");
-    } catch {
-      setBackendStatus("Backend unreachable");
-    }
+  console.log("Checking health at:", `${API_BASE}/health`);
+  try {
+    const res = await fetch(`${API_BASE}/health`, { headers: authHeaders() });
+    if (!res.ok) throw new Error();
+    setBackendStatus("Connected");
+  } catch (e) {
+    console.error("Health check failed:", e);
+    setBackendStatus("Disconnected — start backend");
   }
+}
 
   async function refreshDocs(selectFirst = false) {
     try {
@@ -274,7 +276,7 @@ export default function App() {
           <div>
             <h1 className="text-xl font-semibold">SecRAG</h1>
             <p className="text-xs text-gray-500 dark:text-zinc-400">
-              Day 11 — Production Ready
+              PDF Q&A with verified citations
             </p>
             <p className="text-xs text-gray-600 dark:text-zinc-300 mt-2">
               Backend: <span className="font-medium">{backendStatus}</span>

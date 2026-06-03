@@ -1,14 +1,3 @@
-"""
-uploader.py  —  Updated PDF ingestion pipeline.
-
-Changes from original:
-  1. Stores embeddings in ChromaDB (via vector_store.py) instead of .npy files
-  2. Supports all three chunking strategies (default: "sentence")
-  3. Near-duplicate deduplication on insert (threshold 0.95 cosine)
-  4. Also writes .npy + chunk JSON for backward compat with legacy retrieve path
-  5. Returns richer stats including strategy used and dedup counts
-"""
-
 from __future__ import annotations
 
 import os
@@ -31,28 +20,20 @@ def process_pdf_upload(
     chunk_size: int = 500,
     chroma_dir: str | None = None,
 ):
-    """
-    Full ingestion pipeline for a PDF.
 
-    chunk_strategy: "sentence" | "fixed" | "semantic"
-    chroma_dir: path for ChromaDB storage (defaults to data_dir/chroma)
-    """
     file_path = Path(file_path)
     data_dir = Path(data_dir)
     chroma_dir = chroma_dir or str(data_dir / "chroma")
 
-    # --- Extract text ---
     reader = PdfReader(str(file_path))
     extracted_text = ""
     for page in reader.pages:
         extracted_text += page.extract_text() or ""
 
-    # Save raw text for debugging
     text_path = data_dir / (file_path.stem + ".txt")
     text_path.parent.mkdir(parents=True, exist_ok=True)
     text_path.write_text(extracted_text, encoding="utf-8")
 
-    # --- Chunk ---
     raw_chunks = chunk_text(extracted_text, strategy=chunk_strategy, chunk_size=chunk_size)
     created_at = datetime.utcnow().isoformat()
     pdf_name = file_path.name
@@ -70,11 +51,10 @@ def process_pdf_upload(
             "chunk_strategy": strategy_name,
         })
 
-    # --- Embed ---
+
     texts = [c["content"] for c in chunk_data]
     vectors = embed_texts(texts)
 
-    # --- Save to ChromaDB with dedup ---
     inserted_count = upsert_chunks(
         pdf_name=pdf_name,
         chunk_data=chunk_data,
@@ -83,7 +63,6 @@ def process_pdf_upload(
     )
     dedup_skipped = len(chunk_data) - inserted_count
 
-    # --- Also write legacy .npy + JSON for backward compat ---
     chunk_filename = file_path.stem + "_chunks.json"
     chunk_path = data_dir / chunk_filename
     with open(chunk_path, "w", encoding="utf-8") as f:

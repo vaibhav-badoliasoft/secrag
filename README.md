@@ -14,6 +14,19 @@
 
 ---
 
+## Evaluation Results
+
+Evaluated on a 48-question golden Q&A dataset against the BERT paper (Devlin et al., 2019):
+
+| Metric | Score |
+|---|---|
+| Average answer quality | 4.15 / 5.0 |
+| Citation accuracy | 99.6% |
+| Questions scored 4 or 5 | 83% |
+| Total questions | 48 |
+
+---
+
 ## How It Was Built
 
 ### Month 1 — Core RAG Foundation

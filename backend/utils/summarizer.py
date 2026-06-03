@@ -6,13 +6,6 @@ load_dotenv()
 
 
 def summarize_from_chunks(filename: str, chunks: list, max_output_tokens: int = 350) -> str:
-    """
-    Summarize using ONLY the provided chunk list (hybrid-selected context).
-    Each chunk is expected to include:
-      - chunk_id
-      - content
-      - (optional) score
-    """
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY not set.")

@@ -53,10 +53,7 @@ Answer with inline [Chunk N] citations after every claim:"""
 
 
 def generate_sample_questions(filename: str, context: str, max_output_tokens: int = 220) -> list[str]:
-    """
-    Returns 6 content-aware sample questions as list[str].
-    Tries JSON parse first; falls back to line parsing.
-    """
+
     client = _get_client()
 
     prompt = f"""

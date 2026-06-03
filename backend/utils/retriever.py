@@ -1,17 +1,3 @@
-"""
-retriever.py  —  Upgraded retrieval layer.
-
-Changes from original:
-  1. Reads from ChromaDB instead of .npy files (via vector_store.py)
-  2. RRF (Reciprocal Rank Fusion) replaces weighted linear combination
-  3. Cross-encoder reranker as a second-pass filter (top-20 → top-5)
-  4. load_chunks / load_embeddings still work for backward-compat with app.py
-     but the main path is retrieve_top_k_v2() which uses ChromaDB.
-
-retrieve_top_k() signature is preserved exactly for backward compatibility.
-The /answer and /retrieve endpoints can keep calling it unchanged.
-"""
-
 from __future__ import annotations
 
 import json
@@ -27,9 +13,6 @@ from utils.vector_store import query_collection
 logger = logging.getLogger("secrag.retriever")
 
 
-# ---------------------------------------------------------------------------
-# Legacy helpers (kept for backward compat)
-# ---------------------------------------------------------------------------
 
 def load_chunks(chunks_path: Path) -> list[dict]:
     with open(chunks_path, "r", encoding="utf-8") as f:
@@ -75,15 +58,9 @@ def _build_results(chunks: list, indices: np.ndarray, scores: np.ndarray, min_sc
     return results
 
 
-# ---------------------------------------------------------------------------
-# RRF Fusion
-# ---------------------------------------------------------------------------
 
 def _rrf_fuse(dense_ranked: list[dict], sparse_ranked: list[dict], k: int = 60) -> list[dict]:
-    """
-    Reciprocal Rank Fusion: score(d) = Σ 1 / (k + rank(d))
-    Combines dense (vector) and sparse (BM25) ranked lists.
-    """
+
     scores: dict[str, float] = {}
     chunk_map: dict[str, dict] = {}
 
@@ -98,7 +75,6 @@ def _rrf_fuse(dense_ranked: list[dict], sparse_ranked: list[dict], k: int = 60) 
         if cid not in chunk_map:
             chunk_map[cid] = item
 
-    # Sort by RRF score descending
     fused = []
     for cid, rrf_score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
         item = dict(chunk_map[cid])
@@ -109,10 +85,6 @@ def _rrf_fuse(dense_ranked: list[dict], sparse_ranked: list[dict], k: int = 60) 
     return fused
 
 
-# ---------------------------------------------------------------------------
-# Main retrieval function (ChromaDB path)
-# ---------------------------------------------------------------------------
-
 def retrieve_top_k(
     query: str,
     pdf_name: str | None = None,
@@ -121,17 +93,12 @@ def retrieve_top_k(
     mode: str = "hybrid",
     alpha: float = 0.7,
     use_reranker: bool = True,
-    # Legacy params — accepted but ignored when pdf_name is provided
+    chroma_dir: str = "./data/chroma",
     chunks_path: Path | None = None,
     embeddings_path: Path | None = None,
     candidate_mult: int = 4,
 ) -> list[dict]:
-    """
-    Retrieve top-k chunks for query.
 
-    New path: pass pdf_name → uses ChromaDB + RRF + reranker.
-    Legacy path: pass chunks_path + embeddings_path → uses .npy files (unchanged).
-    """
     if not query or not query.strip():
         raise ValueError("Query cannot be empty")
     if top_k <= 0:
@@ -141,7 +108,6 @@ def retrieve_top_k(
     if mode not in {"hybrid", "semantic", "bm25"}:
         raise ValueError("mode must be one of: hybrid, semantic, bm25")
 
-    # ---- ChromaDB path ----
     if pdf_name is not None:
         return _retrieve_chromadb(
             query=query,
@@ -151,9 +117,9 @@ def retrieve_top_k(
             mode=mode,
             use_reranker=use_reranker,
             candidate_mult=candidate_mult,
+            chroma_dir=chroma_dir,
         )
 
-    # ---- Legacy .npy path (unchanged from original) ----
     if chunks_path is None or embeddings_path is None:
         raise ValueError("Either pdf_name or both chunks_path and embeddings_path must be provided")
     return _retrieve_legacy(
@@ -176,24 +142,22 @@ def _retrieve_chromadb(
     mode: str,
     use_reranker: bool,
     candidate_mult: int,
+    chroma_dir: str = "./data/chroma",
 ) -> list[dict]:
-    """ChromaDB + RRF + optional reranker."""
     query_vec = embed_query(query)
-    candidate_k = top_k * candidate_mult  # get 20 candidates, rerank to top_k
+    candidate_k = top_k * candidate_mult
 
     dense_results: list[dict] = []
     sparse_results: list[dict] = []
 
     if mode in {"semantic", "hybrid"}:
-        dense_results = query_collection(pdf_name, query_vec, top_k=candidate_k)
+        dense_results = query_collection(pdf_name, query_vec, top_k=candidate_k, persist_dir=chroma_dir)
 
     if mode in {"bm25", "hybrid"}:
-        # For BM25 we still need chunks — pull from Chroma metadata
         if dense_results:
-            # Re-use already-fetched docs to build BM25 corpus
             bm25_corpus = dense_results
         else:
-            bm25_corpus = query_collection(pdf_name, query_vec, top_k=min(200, candidate_k * 5))
+            bm25_corpus = query_collection(pdf_name, query_vec, top_k=min(200, candidate_k * 5), persist_dir=chroma_dir)
 
         if bm25_corpus:
             bm25 = build_bm25(bm25_corpus)
@@ -204,7 +168,7 @@ def _retrieve_chromadb(
                 for i in np.argsort(-bm25_norm)[:candidate_k]
             ]
 
-    # Fuse
+ 
     if mode == "semantic":
         candidates = dense_results[:candidate_k]
     elif mode == "bm25":
@@ -212,11 +176,9 @@ def _retrieve_chromadb(
     else:
         candidates = _rrf_fuse(dense_results, sparse_results)[:candidate_k]
 
-    # Apply min_score filter
     if min_score is not None:
         candidates = [c for c in candidates if c["score"] >= min_score]
 
-    # Rerank
     if use_reranker and candidates:
         try:
             from utils.reranker import rerank
@@ -240,7 +202,6 @@ def _retrieve_legacy(
     alpha: float,
     candidate_mult: int,
 ) -> list[dict]:
-    """Original .npy-based retrieval — completely unchanged."""
     chunks = load_chunks(chunks_path)
     n = len(chunks)
     if n == 0:
@@ -273,7 +234,6 @@ def _retrieve_legacy(
         idx = idx[np.argsort(-bm25_norm[idx])]
         return _build_results(chunks, idx, bm25_norm, min_score=min_score)
 
-    # Hybrid: weighted linear combination (legacy, unchanged)
     if not (0.0 <= alpha <= 1.0):
         raise ValueError("alpha must be between 0 and 1")
     k_candidates = min(n, top_k * candidate_mult)

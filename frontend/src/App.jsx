@@ -30,13 +30,11 @@ export default function App() {
 
   const [messages, setMessages] = useState([]);
 
-  // Dark mode (persisted)
   const [darkMode, setDarkMode] = useState(() => {
     const saved = localStorage.getItem("secrag_dark");
     return saved === "1";
   });
 
-  // Delete modal state
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState("");
@@ -270,7 +268,6 @@ export default function App() {
 
   return (
     <div className="h-screen flex bg-gray-50 text-gray-900 dark:bg-zinc-950 dark:text-zinc-100">
-      {/* LEFT SIDEBAR */}
       <aside className="w-[320px] border-r bg-white p-4 space-y-4 dark:bg-zinc-900 dark:border-zinc-800">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -326,7 +323,6 @@ export default function App() {
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-medium">Documents</h2>
 
-            {/* Document count badge */}
             <span className="text-xs px-2 py-1 rounded-full border bg-gray-50 dark:bg-zinc-800 dark:border-zinc-700">
               {docs.length}
             </span>
@@ -398,7 +394,6 @@ export default function App() {
         </div>
       </aside>
 
-      {/* MAIN */}
       <main className="flex-1 flex flex-col">
         <header className="h-14 border-b bg-white px-6 flex items-center justify-between dark:bg-zinc-900 dark:border-zinc-800">
           <div className="font-medium">Chat</div>
@@ -458,8 +453,6 @@ export default function App() {
           </button>
         </footer>
       </main>
-
-      {/* DELETE MODAL */}
       {showDeleteModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div

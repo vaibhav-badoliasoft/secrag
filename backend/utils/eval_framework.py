@@ -1,41 +1,3 @@
-"""
-eval_framework.py  —  Golden Q&A dataset and automated evaluation metrics.
-
-Three things in one file:
-  1. GoldenDataset  — load/save/add hand-curated Q&A pairs
-  2. run_eval()     — score a RAG pipeline against the dataset
-  3. compare_chunking_strategies()  — run the same eval with all three strategies
-
-Golden dataset format (JSON):
-[
-  {
-    "id": "q001",
-    "question": "What is the purpose of X?",
-    "expected_answer": "X is used for ...",
-    "source_chunks": ["chunk text that should be retrieved"],
-    "difficulty": "easy" | "moderate" | "hard",
-    "category": "factual" | "multi-hop" | "no-answer",
-    "notes": "optional"
-  }
-]
-
-Usage:
-    from utils.eval_framework import GoldenDataset, run_eval
-
-    ds = GoldenDataset("data/eval/golden_qa.json")
-    ds.add(question="...", expected_answer="...", difficulty="easy")
-    ds.save()
-
-    report = run_eval(
-        dataset=ds,
-        pdf_name="my_doc.pdf",
-        retrieve_fn=retrieve_top_k,   # your existing function
-        answer_fn=generate_answer,
-        verify_fn=verify_citations,   # optional
-    )
-    print(report["summary"])
-"""
-
 from __future__ import annotations
 
 import json
@@ -48,10 +10,6 @@ from typing import Callable
 
 logger = logging.getLogger("secrag.eval")
 
-
-# ---------------------------------------------------------------------------
-# Golden Dataset
-# ---------------------------------------------------------------------------
 
 class GoldenDataset:
     def __init__(self, path: str = "data/eval/golden_qa.json"):
@@ -96,16 +54,8 @@ class GoldenDataset:
     def __len__(self):
         return len(self._data)
 
-
-# ---------------------------------------------------------------------------
-# LLM-as-judge scorer
-# ---------------------------------------------------------------------------
-
 def _score_answer(question: str, expected: str, actual: str) -> dict:
-    """
-    Uses GPT-4o-mini to score actual answer correctness vs expected answer.
-    Returns {score: 1-5, reasoning: str}
-    """
+
     try:
         from openai import OpenAI
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -138,20 +88,13 @@ def _score_answer(question: str, expected: str, actual: str) -> dict:
 
 
 def _score_retrieval(expected_chunks: list[str], retrieved_chunks: list[dict]) -> float:
-    """
-    Simple retrieval relevance: fraction of expected_chunks that appear in retrieved content.
-    Uses substring matching (fast, no LLM needed).
-    """
+
     if not expected_chunks:
         return 1.0
     retrieved_text = " ".join(c.get("content", "") for c in retrieved_chunks).lower()
     hits = sum(1 for ec in expected_chunks if ec.lower()[:100] in retrieved_text)
     return round(hits / len(expected_chunks), 3)
 
-
-# ---------------------------------------------------------------------------
-# Main eval runner
-# ---------------------------------------------------------------------------
 
 def run_eval(
     dataset: GoldenDataset,
@@ -164,15 +107,6 @@ def run_eval(
     chunk_strategy: str = "sentence",
     run_label: str | None = None,
 ) -> dict:
-    """
-    Run the full eval pipeline against the golden dataset.
-
-    retrieve_fn signature: (chunks_path, embeddings_path, query, top_k, ...) -> list[dict]
-    answer_fn signature:   (query, retrieved_chunks) -> str
-    verify_fn signature:   (answer_text, retrieved_chunks) -> dict  (optional)
-
-    Returns a structured report dict.
-    """
     label = run_label or f"{chunk_strategy}_{retrieval_mode}_{datetime.utcnow().strftime('%H%M%S')}"
     results = []
 
@@ -180,27 +114,22 @@ def run_eval(
         q = item["question"]
         expected = item["expected_answer"]
 
-        # Retrieve
         try:
             retrieved = retrieve_fn(query=q, top_k=top_k, mode=retrieval_mode)
         except Exception as e:
             logger.warning(f"Retrieval failed for '{q[:50]}': {e}")
             retrieved = []
 
-        # Answer
         try:
             answer = answer_fn(q, retrieved) if retrieved else "No relevant context found."
         except Exception as e:
             logger.warning(f"Answer failed for '{q[:50]}': {e}")
             answer = ""
 
-        # Score answer quality
         quality = _score_answer(q, expected, answer)
 
-        # Score retrieval relevance
         retrieval_score = _score_retrieval(item.get("source_chunks", []), retrieved)
 
-        # Citation verification (optional)
         citation_accuracy = None
         if verify_fn and retrieved:
             try:
@@ -223,7 +152,6 @@ def run_eval(
             "retrieved_count": len(retrieved),
         })
 
-    # Build summary
     scores = [r["answer_score"] for r in results]
     retrieval_scores = [r["retrieval_relevance"] for r in results]
     citation_scores = [r["citation_accuracy"] for r in results if r["citation_accuracy"] is not None]
@@ -255,20 +183,12 @@ def _group_scores(results: list[dict], key: str) -> dict:
     return {k: round(sum(v) / len(v), 2) for k, v in groups.items()}
 
 
-# ---------------------------------------------------------------------------
-# Chunking strategy comparison
-# ---------------------------------------------------------------------------
-
 def compare_chunking_strategies(
     dataset: GoldenDataset,
     pdf_name: str,
-    retrieve_fn_factory: Callable,   # takes strategy name, returns retrieve_fn
+    retrieve_fn_factory: Callable,
     answer_fn: Callable,
 ) -> dict:
-    """
-    Run the eval suite for all three chunking strategies and return a comparison.
-    retrieve_fn_factory("sentence") should return a retrieve_fn that uses sentence-chunked data.
-    """
     comparison = {}
     from utils.chunking_strategies import STRATEGIES
     for strategy in STRATEGIES:
@@ -286,7 +206,6 @@ def compare_chunking_strategies(
         except Exception as e:
             comparison[strategy] = {"error": str(e)}
 
-    # Find winner per metric
     strategies_with_data = [s for s in STRATEGIES if "error" not in comparison.get(s, {})]
     if strategies_with_data:
         best_answer = max(strategies_with_data, key=lambda s: comparison[s].get("avg_answer_score", 0))

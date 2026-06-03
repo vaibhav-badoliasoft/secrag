@@ -1,19 +1,3 @@
-"""
-reranker.py  —  Cross-encoder reranker that cuts top-20 candidates to top-5.
-
-Two backends:
-  1. cross-encoder/ms-marco-MiniLM-L-6-v2  (fast, free, local)
-     pip install sentence-transformers  (already in your env)
-  2. LLM-as-judge fallback (uses OpenAI if cross-encoder unavailable)
-
-Usage:
-    from utils.reranker import rerank
-
-    # candidates: list of dicts with "content" key (output from retrieve_top_k)
-    reranked = rerank(query, candidates, top_k=5)
-    # returns same list shape, sorted by rerank score, top_k items
-"""
-
 from __future__ import annotations
 
 import os
@@ -22,9 +6,6 @@ from typing import Any
 
 logger = logging.getLogger("secrag.reranker")
 
-# ---------------------------------------------------------------------------
-# Cross-encoder backend
-# ---------------------------------------------------------------------------
 
 _ce_model = None
 _ce_available = None
@@ -54,21 +35,13 @@ def _rerank_cross_encoder(query: str, candidates: list[dict]) -> list[dict]:
     return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
 
 
-# ---------------------------------------------------------------------------
-# LLM-as-judge fallback
-# ---------------------------------------------------------------------------
-
 def _rerank_llm(query: str, candidates: list[dict]) -> list[dict]:
-    """
-    Ask GPT-4o-mini to score each chunk's relevance to the query (1-10).
-    Batches all chunks in a single request to keep costs low.
-    """
+
     try:
         from openai import OpenAI
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     except Exception as e:
         logger.error(f"Reranker LLM fallback failed to init OpenAI: {e}")
-        # Last resort: return original order with original scores
         for c in candidates:
             c["rerank_score"] = c.get("score", 0.0)
             c["rerank_method"] = "passthrough"
@@ -107,19 +80,8 @@ def _rerank_llm(query: str, candidates: list[dict]) -> list[dict]:
     return sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def rerank(query: str, candidates: list[dict], top_k: int = 5) -> list[dict]:
-    """
-    Rerank `candidates` for `query`. Returns at most `top_k` items.
 
-    Each candidate dict must have a "content" key.
-    The returned dicts gain two new keys:
-      - rerank_score: float
-      - rerank_method: "cross-encoder" | "llm-judge" | "passthrough"
-    """
     if not candidates:
         return []
 

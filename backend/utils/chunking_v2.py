@@ -6,9 +6,6 @@ _SENTENCE_RE = re.compile(r".+?(?:[.!?]+(?=\s|$)|$)", re.DOTALL)
 
 
 def split_sentences_with_spans(text: str) -> List[Tuple[int, int, str]]:
-    """
-    Returns [(start, end, sentence_text), ...] with true char spans into the original text.
-    """
     spans = []
     for m in _SENTENCE_RE.finditer(text):
         s = m.group(0)

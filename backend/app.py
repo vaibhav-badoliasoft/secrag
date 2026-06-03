@@ -27,7 +27,6 @@ SECRAG_API_KEY = os.getenv("SECRAG_API_KEY", "").strip()
 
 app = FastAPI()
 
-# --- Config ---
 def _parse_origins(val: str | None):
     if not val:
         return ["http://localhost:5173"]
@@ -49,7 +48,6 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = (BASE_DIR / ".." / "data").resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Logging middleware ---
 @app.middleware("http")
 async def log_and_auth(request: Request, call_next):
     request_id = str(uuid.uuid4())
@@ -73,7 +71,6 @@ async def log_and_auth(request: Request, call_next):
                 }))
                 raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # --- Process request ---
     try:
         response = await call_next(request)
         status = response.status_code
@@ -102,7 +99,6 @@ async def log_and_auth(request: Request, call_next):
     response.headers["X-Process-Time"] = f"{elapsed:.4f}"
     return response
 
-# --- Helpers ---
 def normalize_pdf_filename(name: str) -> str:
     name = (name or "").strip()
     if not name:
@@ -148,7 +144,6 @@ def artifact_stats_for_pdf(pdf_name: str):
     }
 
 
-# --- Endpoints ---
 @app.get("/health")
 def health_check():
     return {"status": "SecRAG backend is running", "allowed_origins": ALLOWED_ORIGINS}

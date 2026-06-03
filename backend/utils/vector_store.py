@@ -1,15 +1,3 @@
-"""
-vector_store.py  —  ChromaDB-backed persistent store (replaces .npy + per-file embeddings).
-
-Drop-in replacement layer. The rest of the codebase calls:
-    get_collection(pdf_name) -> chroma Collection
-    upsert_chunks(pdf_name, chunk_data, vectors)
-    query_collection(pdf_name, query_vec, top_k) -> list[dict]  # same shape as old _build_results
-    collection_exists(pdf_name) -> bool
-    delete_collection(pdf_name)
-    near_duplicate_exists(pdf_name, vector, threshold=0.95) -> bool   # for dedup
-"""
-
 import hashlib
 from pathlib import Path
 
@@ -28,9 +16,7 @@ def _get_client(persist_dir: str = "./data/chroma") -> chromadb.Client:
 
 
 def _collection_name(pdf_name: str) -> str:
-    # Chroma requires collection names to be valid identifiers
     stem = Path(pdf_name).stem.lower()
-    # Replace non-alphanum with underscore, truncate to 60 chars
     safe = "".join(c if c.isalnum() else "_" for c in stem)[:60]
     return f"secrag_{safe}"
 
@@ -58,16 +44,12 @@ def upsert_chunks(
     vectors: np.ndarray,
     persist_dir: str = "./data/chroma",
 ):
-    """
-    Upsert chunks with deduplication. Skips any chunk whose embedding is
-    within `threshold` cosine similarity of an already-stored chunk.
-    """
+
     collection = get_collection(pdf_name, persist_dir)
 
     ids, embeddings, documents, metadatas = [], [], [], []
 
     for idx, (chunk, vec) in enumerate(zip(chunk_data, vectors)):
-        # --- deduplication check ---
         if near_duplicate_exists_vec(collection, vec, threshold=0.95):
             continue
 
@@ -96,11 +78,7 @@ def query_collection(
     top_k: int = 20,
     persist_dir: str = "./data/chroma",
 ) -> list[dict]:
-    """
-    Returns top_k results in the same dict shape as retriever._build_results.
-    Distances from Chroma are cosine distances (0=identical, 2=opposite);
-    we convert to similarity score in [0,1].
-    """
+
     collection = get_collection(pdf_name, persist_dir)
 
     count = collection.count()
@@ -120,7 +98,7 @@ def query_collection(
         result["metadatas"][0],
         result["distances"][0],
     )):
-        score = float(1.0 - dist / 2.0)  # cosine dist -> cosine similarity
+        score = float(1.0 - dist / 2.0)
         out.append({
             "score": score,
             "chunk_id": result["ids"][0][i],

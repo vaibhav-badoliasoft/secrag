@@ -1,35 +1,3 @@
-"""
-citation_verifier.py  —  LLM-as-judge citation verification layer.
-
-After the LLM generates an answer with inline [Chunk N] citations,
-this module verifies that each cited chunk actually supports the claim
-it's attached to.
-
-Usage:
-    from utils.citation_verifier import verify_citations, parse_citations
-
-    # answer_text: the raw LLM answer string containing [Chunk N] markers
-    # retrieved:   list of dicts from retrieve_top_k (each has chunk_id + content)
-    result = verify_citations(answer_text, retrieved)
-
-    result = {
-        "verified_answer": str,           # answer with unsupported citations flagged
-        "citation_accuracy": float,       # e.g. 0.83
-        "citations": [
-            {
-                "chunk_id": "2",
-                "claim": "...",           # sentence containing the citation
-                "supported": True | False,
-                "confidence": float,      # 0-1
-                "reason": str,
-            },
-            ...
-        ],
-        "unsupported_count": int,
-        "total_citations": int,
-    }
-"""
-
 from __future__ import annotations
 
 import os
@@ -39,16 +7,10 @@ import logging
 
 logger = logging.getLogger("secrag.citation_verifier")
 
-# Matches [Chunk 3], [3], [Chunk3] — all common citation formats
 _CITATION_RE = re.compile(r"\[(?:Chunk\s*)?(\d+)\]", re.IGNORECASE)
 
 
 def parse_citations(answer_text: str) -> list[dict]:
-    """
-    Extract citation positions from the answer text.
-    Returns list of {chunk_id: str, claim: str (surrounding sentence)}.
-    """
-    # Split into sentences for context
     sentences = re.split(r"(?<=[.!?])\s+", answer_text)
     results = []
     seen = set()
@@ -64,12 +26,10 @@ def parse_citations(answer_text: str) -> list[dict]:
 
 
 def _build_chunk_map(retrieved: list[dict]) -> dict[str, str]:
-    """Map chunk_id (str) -> content."""
     return {str(c.get("chunk_id", "")): c.get("content", "") for c in retrieved}
 
 
 def _verify_single(claim: str, chunk_content: str, client) -> dict:
-    """Ask GPT-4o-mini whether chunk_content supports claim."""
     prompt = (
         "Does the following SOURCE TEXT support the CLAIM?\n\n"
         f"CLAIM: {claim}\n\n"
@@ -96,10 +56,6 @@ def _verify_single(claim: str, chunk_content: str, client) -> dict:
 
 
 def verify_citations(answer_text: str, retrieved: list[dict]) -> dict:
-    """
-    Verify every [Chunk N] citation in `answer_text` against retrieved chunks.
-    Returns structured result dict (see module docstring).
-    """
     try:
         from openai import OpenAI
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -124,7 +80,6 @@ def verify_citations(answer_text: str, retrieved: list[dict]) -> dict:
         cid = cit["chunk_id"]
         content = chunk_map.get(cid, "")
         if not content:
-            # Citation references a chunk that wasn't retrieved
             citation_results.append({
                 "chunk_id": cid,
                 "claim": cit["claim"],
@@ -140,7 +95,6 @@ def verify_citations(answer_text: str, retrieved: list[dict]) -> dict:
                 **verdict,
             })
 
-    # Flag unsupported citations in the answer text
     unsupported_ids = {c["chunk_id"] for c in citation_results if not c["supported"]}
     verified_answer = answer_text
     if unsupported_ids:

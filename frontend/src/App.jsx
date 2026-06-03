@@ -10,8 +10,8 @@ function authHeaders(extra = {}) {
 }
 
 function confidenceFromScore(score) {
-  if (score >= 0.6) return { label: "High", tone: "text-green-700 dark:text-green-400" };
-  if (score >= 0.45) return { label: "Medium", tone: "text-yellow-700 dark:text-yellow-400" };
+  if (score >= 0.03) return { label: "High", tone: "text-green-700 dark:text-green-400" };
+  if (score >= 0.02) return { label: "Medium", tone: "text-yellow-700 dark:text-yellow-400" };
   return { label: "Low", tone: "text-red-700 dark:text-red-400" };
 }
 
@@ -87,7 +87,7 @@ export default function App() {
       if (selectFirst && !selectedDoc && list.length > 0) {
         setSelectedDoc(list[0]);
       }
-    } catch (e) {
+    } catch {
       // ignore
     }
   }
@@ -113,7 +113,7 @@ export default function App() {
       setSelectedDoc(data?.filename || "");
 
       pushSystem(
-        `Uploaded ${data.filename} • ${data.total_chunks} chunks • ${data.embedding_dim} dim`
+        `Uploaded ${data.filename} • ${data.chunks_inserted_to_chroma ?? data.total_chunks} chunks • ${data.embedding_dim} dim`
       );
     } catch (e) {
       pushSystem(`Upload error: ${e.message}`);
@@ -160,7 +160,7 @@ export default function App() {
 
       const topScore =
         Array.isArray(data?.citations) && data.citations.length > 0
-          ? Number(data.citations[0].score ?? 0)
+          ? Number(data.citations[0].rerank_score ?? data.citations[0].score ?? 0)
           : 0;
 
       const conf = confidenceFromScore(topScore);

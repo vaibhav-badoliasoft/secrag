@@ -18,6 +18,11 @@ backend/data/
 *_chunks.json
 *.txt
 
+# ChromaDB
+backend/data/chroma/
+*.sqlite3
+
+
 # =========================
 # Node / Frontend
 # =========================
@@ -52,3 +57,4 @@ frontend/.env
 Thumbs.db
 .vscode/
 .idea/
+

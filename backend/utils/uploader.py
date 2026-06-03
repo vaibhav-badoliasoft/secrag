@@ -1,58 +1,106 @@
+"""
+uploader.py  —  Updated PDF ingestion pipeline.
+
+Changes from original:
+  1. Stores embeddings in ChromaDB (via vector_store.py) instead of .npy files
+  2. Supports all three chunking strategies (default: "sentence")
+  3. Near-duplicate deduplication on insert (threshold 0.95 cosine)
+  4. Also writes .npy + chunk JSON for backward compat with legacy retrieve path
+  5. Returns richer stats including strategy used and dedup counts
+"""
+
+from __future__ import annotations
+
 import os
 import json
 import numpy as np
 from datetime import datetime
-from pypdf import PdfReader
 from pathlib import Path
 
-from utils.chunking_v2 import chunk_text_sentence_based
+from pypdf import PdfReader
+
+from utils.chunking_strategies import chunk_text
 from utils.embeddings import embed_texts
+from utils.vector_store import upsert_chunks, collection_exists
 
 
-def process_pdf_upload(file_path: str, data_dir: str):
-    reader = PdfReader(file_path)
+def process_pdf_upload(
+    file_path: str,
+    data_dir: str,
+    chunk_strategy: str = "sentence",
+    chunk_size: int = 500,
+    chroma_dir: str | None = None,
+):
+    """
+    Full ingestion pipeline for a PDF.
 
+    chunk_strategy: "sentence" | "fixed" | "semantic"
+    chroma_dir: path for ChromaDB storage (defaults to data_dir/chroma)
+    """
+    file_path = Path(file_path)
+    data_dir = Path(data_dir)
+    chroma_dir = chroma_dir or str(data_dir / "chroma")
+
+    # --- Extract text ---
+    reader = PdfReader(str(file_path))
     extracted_text = ""
     for page in reader.pages:
         extracted_text += page.extract_text() or ""
 
-    text_filename = os.path.basename(file_path).replace(".pdf", ".txt")
-    text_path = os.path.join(data_dir, text_filename)
-    with open(text_path, "w", encoding="utf-8") as f:
-        f.write(extracted_text)
+    # Save raw text for debugging
+    text_path = data_dir / (file_path.stem + ".txt")
+    text_path.parent.mkdir(parents=True, exist_ok=True)
+    text_path.write_text(extracted_text, encoding="utf-8")
 
-    chunks = chunk_text_sentence_based(extracted_text, chunk_size=500, overlap_sentences=1)
+    # --- Chunk ---
+    raw_chunks = chunk_text(extracted_text, strategy=chunk_strategy, chunk_size=chunk_size)
     created_at = datetime.utcnow().isoformat()
+    pdf_name = file_path.name
 
     chunk_data = []
-    for index, (char_start, char_end, chunk) in enumerate(chunks):
+    for index, (char_start, char_end, chunk_content, strategy_name) in enumerate(raw_chunks):
         chunk_data.append({
             "chunk_id": index,
-            "filename": os.path.basename(file_path),
-            "source_path": file_path,
+            "filename": pdf_name,
+            "source_path": str(file_path),
             "created_at": created_at,
             "char_start": char_start,
             "char_end": char_end,
-            "content": chunk
+            "content": chunk_content,
+            "chunk_strategy": strategy_name,
         })
 
-    chunk_filename = os.path.basename(file_path).replace(".pdf", "_chunks.json")
-    chunk_path = os.path.join(data_dir, chunk_filename)
-    with open(chunk_path, "w", encoding="utf-8") as f:
-        json.dump(chunk_data, f, indent=2)
-
+    # --- Embed ---
     texts = [c["content"] for c in chunk_data]
     vectors = embed_texts(texts)
 
-    stem = Path(file_path).stem
-    emb_filename = f"{stem}_embedding.npy"
-    emb_path = os.path.join(data_dir, emb_filename)
-    np.save(emb_path, vectors)
+    # --- Save to ChromaDB with dedup ---
+    inserted_count = upsert_chunks(
+        pdf_name=pdf_name,
+        chunk_data=chunk_data,
+        vectors=vectors,
+        persist_dir=chroma_dir,
+    )
+    dedup_skipped = len(chunk_data) - inserted_count
+
+    # --- Also write legacy .npy + JSON for backward compat ---
+    chunk_filename = file_path.stem + "_chunks.json"
+    chunk_path = data_dir / chunk_filename
+    with open(chunk_path, "w", encoding="utf-8") as f:
+        json.dump(chunk_data, f, indent=2)
+
+    emb_filename = file_path.stem + "_embedding.npy"
+    emb_path = data_dir / emb_filename
+    np.save(str(emb_path), vectors)
 
     return {
-        "filename": os.path.basename(file_path),
+        "filename": pdf_name,
         "total_characters": len(extracted_text),
-        "total_chunks": len(chunk_data),
+        "total_chunks_raw": len(chunk_data),
+        "chunks_inserted_to_chroma": inserted_count,
+        "chunks_dedup_skipped": dedup_skipped,
+        "chunk_strategy": chunk_strategy,
         "embedding_dim": int(vectors.shape[1]) if vectors.ndim == 2 else 0,
-        "first_chunk_preview": chunk_data[0]["content"][:200] if chunk_data else ""
+        "first_chunk_preview": chunk_data[0]["content"][:200] if chunk_data else "",
+        "chroma_dir": chroma_dir,
     }

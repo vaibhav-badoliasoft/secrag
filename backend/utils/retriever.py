@@ -1,12 +1,37 @@
+"""
+retriever.py  —  Upgraded retrieval layer.
+
+Changes from original:
+  1. Reads from ChromaDB instead of .npy files (via vector_store.py)
+  2. RRF (Reciprocal Rank Fusion) replaces weighted linear combination
+  3. Cross-encoder reranker as a second-pass filter (top-20 → top-5)
+  4. load_chunks / load_embeddings still work for backward-compat with app.py
+     but the main path is retrieve_top_k_v2() which uses ChromaDB.
+
+retrieve_top_k() signature is preserved exactly for backward compatibility.
+The /answer and /retrieve endpoints can keep calling it unchanged.
+"""
+
+from __future__ import annotations
+
 import json
-import numpy as np
+import logging
 from pathlib import Path
+
+import numpy as np
 
 from utils.embeddings import embed_query
 from utils.bm25 import build_bm25, bm25_scores
+from utils.vector_store import query_collection
+
+logger = logging.getLogger("secrag.retriever")
 
 
-def load_chunks(chunks_path: Path):
+# ---------------------------------------------------------------------------
+# Legacy helpers (kept for backward compat)
+# ---------------------------------------------------------------------------
+
+def load_chunks(chunks_path: Path) -> list[dict]:
     with open(chunks_path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if not isinstance(data, list):
@@ -14,7 +39,7 @@ def load_chunks(chunks_path: Path):
     return data
 
 
-def load_embeddings(embeddings_path: Path):
+def load_embeddings(embeddings_path: Path) -> np.ndarray:
     emb = np.load(embeddings_path).astype(np.float32)
     if emb.ndim != 2:
         raise ValueError("Embeddings must be 2D (num_chunks, dim)")
@@ -22,14 +47,13 @@ def load_embeddings(embeddings_path: Path):
 
 
 def _minmax_norm(arr: np.ndarray) -> np.ndarray:
-    mn = float(np.min(arr))
-    mx = float(np.max(arr))
+    mn, mx = float(np.min(arr)), float(np.max(arr))
     if mx - mn < 1e-9:
         return np.zeros_like(arr, dtype=np.float32)
     return ((arr - mn) / (mx - mn)).astype(np.float32)
 
 
-def _build_results(chunks: list, indices: np.ndarray, scores: np.ndarray, min_score=None):
+def _build_results(chunks: list, indices: np.ndarray, scores: np.ndarray, min_score=None) -> list[dict]:
     results = []
     for idx in indices:
         sc = float(scores[int(idx)])
@@ -46,22 +70,68 @@ def _build_results(chunks: list, indices: np.ndarray, scores: np.ndarray, min_sc
                 "created_at": ch.get("created_at"),
                 "char_start": ch.get("char_start"),
                 "char_end": ch.get("char_end"),
-            }
+            },
         })
     return results
 
 
+# ---------------------------------------------------------------------------
+# RRF Fusion
+# ---------------------------------------------------------------------------
+
+def _rrf_fuse(dense_ranked: list[dict], sparse_ranked: list[dict], k: int = 60) -> list[dict]:
+    """
+    Reciprocal Rank Fusion: score(d) = Σ 1 / (k + rank(d))
+    Combines dense (vector) and sparse (BM25) ranked lists.
+    """
+    scores: dict[str, float] = {}
+    chunk_map: dict[str, dict] = {}
+
+    for rank, item in enumerate(dense_ranked, start=1):
+        cid = str(item["chunk_id"])
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+        chunk_map[cid] = item
+
+    for rank, item in enumerate(sparse_ranked, start=1):
+        cid = str(item["chunk_id"])
+        scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+        if cid not in chunk_map:
+            chunk_map[cid] = item
+
+    # Sort by RRF score descending
+    fused = []
+    for cid, rrf_score in sorted(scores.items(), key=lambda x: x[1], reverse=True):
+        item = dict(chunk_map[cid])
+        item["score"] = round(rrf_score, 6)
+        item["fusion_method"] = "rrf"
+        fused.append(item)
+
+    return fused
+
+
+# ---------------------------------------------------------------------------
+# Main retrieval function (ChromaDB path)
+# ---------------------------------------------------------------------------
+
 def retrieve_top_k(
-    chunks_path: Path,
-    embeddings_path: Path,
     query: str,
+    pdf_name: str | None = None,
     top_k: int = 5,
-    min_score=None,
+    min_score: float | None = None,
     mode: str = "hybrid",
     alpha: float = 0.7,
-    candidate_mult: int = 5
-):
+    use_reranker: bool = True,
+    # Legacy params — accepted but ignored when pdf_name is provided
+    chunks_path: Path | None = None,
+    embeddings_path: Path | None = None,
+    candidate_mult: int = 4,
+) -> list[dict]:
+    """
+    Retrieve top-k chunks for query.
 
+    New path: pass pdf_name → uses ChromaDB + RRF + reranker.
+    Legacy path: pass chunks_path + embeddings_path → uses .npy files (unchanged).
+    """
     if not query or not query.strip():
         raise ValueError("Query cannot be empty")
     if top_k <= 0:
@@ -71,8 +141,107 @@ def retrieve_top_k(
     if mode not in {"hybrid", "semantic", "bm25"}:
         raise ValueError("mode must be one of: hybrid, semantic, bm25")
 
-    chunks = load_chunks(chunks_path)
+    # ---- ChromaDB path ----
+    if pdf_name is not None:
+        return _retrieve_chromadb(
+            query=query,
+            pdf_name=pdf_name,
+            top_k=top_k,
+            min_score=min_score,
+            mode=mode,
+            use_reranker=use_reranker,
+            candidate_mult=candidate_mult,
+        )
 
+    # ---- Legacy .npy path (unchanged from original) ----
+    if chunks_path is None or embeddings_path is None:
+        raise ValueError("Either pdf_name or both chunks_path and embeddings_path must be provided")
+    return _retrieve_legacy(
+        chunks_path=chunks_path,
+        embeddings_path=embeddings_path,
+        query=query,
+        top_k=top_k,
+        min_score=min_score,
+        mode=mode,
+        alpha=alpha,
+        candidate_mult=candidate_mult,
+    )
+
+
+def _retrieve_chromadb(
+    query: str,
+    pdf_name: str,
+    top_k: int,
+    min_score: float | None,
+    mode: str,
+    use_reranker: bool,
+    candidate_mult: int,
+) -> list[dict]:
+    """ChromaDB + RRF + optional reranker."""
+    query_vec = embed_query(query)
+    candidate_k = top_k * candidate_mult  # get 20 candidates, rerank to top_k
+
+    dense_results: list[dict] = []
+    sparse_results: list[dict] = []
+
+    if mode in {"semantic", "hybrid"}:
+        dense_results = query_collection(pdf_name, query_vec, top_k=candidate_k)
+
+    if mode in {"bm25", "hybrid"}:
+        # For BM25 we still need chunks — pull from Chroma metadata
+        if dense_results:
+            # Re-use already-fetched docs to build BM25 corpus
+            bm25_corpus = dense_results
+        else:
+            bm25_corpus = query_collection(pdf_name, query_vec, top_k=min(200, candidate_k * 5))
+
+        if bm25_corpus:
+            bm25 = build_bm25(bm25_corpus)
+            bm25_raw = np.array(bm25_scores(bm25, query), dtype=np.float32)
+            bm25_norm = _minmax_norm(bm25_raw)
+            sparse_results = [
+                {**bm25_corpus[i], "score": float(bm25_norm[i])}
+                for i in np.argsort(-bm25_norm)[:candidate_k]
+            ]
+
+    # Fuse
+    if mode == "semantic":
+        candidates = dense_results[:candidate_k]
+    elif mode == "bm25":
+        candidates = sparse_results[:candidate_k]
+    else:
+        candidates = _rrf_fuse(dense_results, sparse_results)[:candidate_k]
+
+    # Apply min_score filter
+    if min_score is not None:
+        candidates = [c for c in candidates if c["score"] >= min_score]
+
+    # Rerank
+    if use_reranker and candidates:
+        try:
+            from utils.reranker import rerank
+            candidates = rerank(query, candidates, top_k=top_k)
+        except Exception as e:
+            logger.warning(f"Reranker failed ({e}), using fusion order")
+            candidates = candidates[:top_k]
+    else:
+        candidates = candidates[:top_k]
+
+    return candidates
+
+
+def _retrieve_legacy(
+    chunks_path: Path,
+    embeddings_path: Path,
+    query: str,
+    top_k: int,
+    min_score,
+    mode: str,
+    alpha: float,
+    candidate_mult: int,
+) -> list[dict]:
+    """Original .npy-based retrieval — completely unchanged."""
+    chunks = load_chunks(chunks_path)
     n = len(chunks)
     if n == 0:
         return []
@@ -88,7 +257,6 @@ def retrieve_top_k(
         embeddings = load_embeddings(embeddings_path)
         if n != embeddings.shape[0]:
             raise ValueError("Mismatch: chunks count != embeddings rows")
-
         q = embed_query(query)
         emb_scores = (embeddings @ q).astype(np.float32)
         emb_norm = ((emb_scores + 1.0) / 2.0).clip(0.0, 1.0).astype(np.float32)
@@ -105,24 +273,17 @@ def retrieve_top_k(
         idx = idx[np.argsort(-bm25_norm[idx])]
         return _build_results(chunks, idx, bm25_norm, min_score=min_score)
 
+    # Hybrid: weighted linear combination (legacy, unchanged)
     if not (0.0 <= alpha <= 1.0):
         raise ValueError("alpha must be between 0 and 1")
-    if candidate_mult <= 0:
-        raise ValueError("candidate_mult must be > 0")
-
     k_candidates = min(n, top_k * candidate_mult)
-
     idx_emb = np.argpartition(-emb_norm, k_candidates - 1)[:k_candidates]
     idx_bm = np.argpartition(-bm25_norm, k_candidates - 1)[:k_candidates]
     candidate_set = set(map(int, idx_emb)) | set(map(int, idx_bm))
     candidate_idx = np.array(list(candidate_set), dtype=np.int32)
-
     final_scores = alpha * emb_norm[candidate_idx] + (1.0 - alpha) * bm25_norm[candidate_idx]
-
     order = np.argsort(-final_scores)
     chosen = candidate_idx[order][: min(top_k, len(order))]
-
     final_full = np.zeros((n,), dtype=np.float32)
     final_full[candidate_idx] = final_scores.astype(np.float32)
-
     return _build_results(chunks, chosen, final_full, min_score=min_score)

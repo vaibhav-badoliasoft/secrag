@@ -17,25 +17,35 @@ def generate_answer(query: str, retrieved_chunks: list):
     client = _get_client()
 
     context = "\n\n".join(
-        f"[Chunk {c['chunk_id']} | Score {round(c['score'],3)}]\n{c['content']}"
+        f"[Chunk {c['chunk_id']}]\n{c['content']}"
         for c in retrieved_chunks
     )
 
-    prompt = f"""
-You are a security expert assistant.
-Answer the question using ONLY the provided context.
-If the answer is not present, say you do not know.
+    system_prompt = """You are a precise document assistant.
+Answer using ONLY the provided context chunks.
+You MUST include inline citations like [Chunk 3] after EVERY factual claim.
+Every sentence MUST end with [Chunk N] before the period.
 
-Context:
+Example of correct format:
+"Vaibhav graduated in 2023 [Chunk 4]. His GPA was 3.96 [Chunk 2]."
+
+Never write a sentence without a citation at the end.
+Never answer without at least one citation.
+If the answer is not in the context, say exactly: "I don't know based on the provided document." """
+
+    user_prompt = f"""Context:
 {context}
 
-Question:
-{query}
-"""
+Question: {query}
+
+Answer with inline [Chunk N] citations after every claim:"""
 
     response = client.responses.create(
         model="gpt-4.1",
-        input=prompt,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         max_output_tokens=500,
     )
 

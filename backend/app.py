@@ -16,6 +16,7 @@ from utils.retriever import retrieve_top_k, load_chunks
 from utils.naming import get_artifact_paths, safe_pdf_name, get_all_related_paths
 from utils.llm import generate_answer
 from utils.summarizer import summarize_from_chunks
+from utils.citation_verifier import verify_citations
 
 load_dotenv()
 
@@ -166,7 +167,7 @@ def stats(filename: str):
 
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), chunk_strategy: str = "sentence"):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
@@ -182,7 +183,7 @@ async def upload_file(file: UploadFile = File(...)):
 
     try:
         safe_file_write(pdf_path, contents)
-        return process_pdf_upload(str(pdf_path), str(DATA_DIR))
+        return process_pdf_upload(str(pdf_path), str(DATA_DIR), chunk_strategy=chunk_strategy)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Upload processing failed: {e}")
 
@@ -244,13 +245,12 @@ def answer(req: AnswerRequest):
 
     try:
         retrieved = retrieve_top_k(
-            chunks_path=chunk_path,
-            embeddings_path=emb_path,
             query=req.query,
+            pdf_name=pdf_name,
             top_k=req.top_k,
             min_score=req.min_score,
             mode=req.mode,
-            alpha=req.alpha
+            use_reranker=True,
         )
 
         if not retrieved:
@@ -258,12 +258,18 @@ def answer(req: AnswerRequest):
 
         answer_text = generate_answer(req.query, retrieved)
 
+        from utils.citation_verifier import verify_citations
+        verification = verify_citations(answer_text, retrieved)
+
         return {
             "filename": pdf_name,
             "query": req.query,
             "top_k": req.top_k,
             "mode": req.mode,
             "answer": answer_text,
+            "verified_answer": verification["verified_answer"],
+            "citation_accuracy": verification["citation_accuracy"],
+            "citation_details": verification["citations"],
             "citations": [
                 {
                     "chunk_id": c["chunk_id"],
